@@ -1,0 +1,2225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Jigsaw Together — serverless multiplayer jigsaw</title>
+<!--
+  ============================================================================
+  JIGSAW TOGETHER — single-file, zero-dependency, serverless multiplayer jigsaw
+  ============================================================================
+  Distribution: this one HTML file is the whole app. No build step, no npm,
+  no backend. Open it in any modern browser (double-click works), load any
+  picture, and play alone or share invite codes for realtime co-op.
+
+  SERVERLESS MULTIPLAYER PROTOCOL (v1) — summary (full spec in NET section):
+  * Transport : WebRTC DataChannels (ordered+reliable), full mesh, plain JSON.
+  * Signaling : manual invite codes (compressed SDP+ICE) with ANY existing
+                member; afterwards members relay SDP between each other, so
+                the mesh self-completes with no server at all.
+  * Session   : no host, state fully replicated; lives while >=1 peer stays.
+                Anyone may join late (snapshot) or leave at any time.
+  * Locking   : per-piece-group optimistic lock, deterministic winner
+                (Lamport clock, then peer id). Loser is told to cancel.
+  * Motion    : while dragging, the anchor position streams at ~30 Hz;
+                remote peers interpolate it every frame.
+  * Media     : the picture travels peer-to-peer in 16 KB chunks, hash-checked.
+  * STUN only : public STUN servers help across NATs; on a LAN it works with
+                no internet at all. No TURN server is used or required.
+  ============================================================================
+-->
+<style>
+:root{
+  --bg:#101216; --bg2:#171b22; --panel:#1b2029; --panel2:#232a36; --line:#2f3846;
+  --tx:#e9edf4; --tx2:#96a1b3; --acc:#e8b34b; --acc2:#f3cf7e; --ok:#53c082; --bad:#e05c48;
+}
+*{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--tx);
+  font:14px/1.45 system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+#board{position:fixed;inset:0;display:block;touch-action:none;cursor:default}
+body.dragging #board{cursor:grabbing}
+body.panning #board{cursor:move}
+
+/* ---------- top bar ---------- */
+.topbar{position:fixed;top:0;left:0;right:0;display:flex;gap:8px;align-items:center;
+  padding:10px 12px;flex-wrap:wrap;z-index:10;pointer-events:none}
+.topbar>*{pointer-events:auto}
+.brand{font-weight:700;font-size:15px;letter-spacing:.4px;padding:7px 4px;color:var(--tx)}
+.brand small{display:block;font-weight:500;font-size:10px;color:var(--tx2);letter-spacing:.6px;text-transform:uppercase}
+.chip{display:flex;gap:8px;align-items:center;background:rgba(27,32,41,.82);border:1px solid var(--line);
+  border-radius:999px;padding:7px 13px;backdrop-filter:blur(8px);font-size:13px;color:var(--tx)}
+.dot{width:9px;height:9px;border-radius:50%;background:#7a8496;flex:none;box-shadow:0 0 0 2px rgba(0,0,0,.25)}
+.dot.on{background:var(--ok)}
+.pdots{display:flex;gap:3px;margin-left:2px}
+.pdots i{width:10px;height:10px;border-radius:50%;display:block;border:1.5px solid rgba(0,0,0,.35)}
+.b{background:rgba(27,32,41,.86);border:1px solid var(--line);color:var(--tx);border-radius:10px;
+  padding:8px 13px;cursor:pointer;font:inherit;font-size:13px;backdrop-filter:blur(8px);white-space:nowrap}
+.b:hover{border-color:var(--acc);color:var(--acc2)}
+.b:disabled{opacity:.45;cursor:default;border-color:var(--line);color:var(--tx)}
+.b.acc{background:var(--acc);border-color:var(--acc);color:#141310;font-weight:600}
+.b.acc:hover{background:var(--acc2);color:#141310}
+.b.ghost{background:transparent}
+
+/* ---------- floating hints / zoom ---------- */
+#hint{position:fixed;left:12px;bottom:10px;color:var(--tx2);font-size:12px;z-index:5;
+  background:rgba(16,18,22,.55);padding:5px 10px;border-radius:8px;pointer-events:none}
+#zoomBox{position:fixed;right:12px;bottom:10px;display:flex;gap:6px;z-index:5}
+#zoomBox .b{padding:6px 11px}
+
+/* ---------- modals ---------- */
+.modal{position:fixed;inset:0;background:rgba(5,7,11,.66);display:none;place-items:center;
+  z-index:50;backdrop-filter:blur(3px);padding:14px}
+.modal.on{display:grid}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;
+  width:min(600px,94vw);max-height:88vh;overflow:auto;box-shadow:0 24px 80px rgba(0,0,0,.55)}
+.panel h2{margin:0 0 4px;font-size:18px}
+.panel h3{margin:16px 0 6px;font-size:14px;color:var(--acc2)}
+.panel p{color:var(--tx2);margin:6px 0;font-size:13px}
+.x{float:right;background:none;border:none;color:var(--tx2);font-size:20px;cursor:pointer;line-height:1;padding:2px 6px}
+.x:hover{color:var(--tx)}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.row.end{justify-content:flex-end}
+.col{display:flex;flex-direction:column;gap:10px}
+label.f{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--tx2)}
+input[type=text],select{background:#0e1116;border:1px solid var(--line);border-radius:9px;color:var(--tx);
+  padding:9px 10px;font:inherit;outline:none}
+input[type=text]:focus,select:focus,textarea.code:focus{border-color:var(--acc)}
+textarea.code{width:100%;min-height:76px;background:#0d1015;border:1px solid var(--line);border-radius:9px;
+  color:#bfe0c8;font:11.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:9px;
+  resize:vertical;word-break:break-all;outline:none}
+.step{display:flex;gap:10px;align-items:flex-start;margin:10px 0}
+.stepn{flex:none;width:22px;height:22px;border-radius:50%;background:var(--panel2);border:1px solid var(--line);
+  color:var(--acc2);font-size:12px;font-weight:700;display:grid;place-items:center;margin-top:2px}
+.status{font-size:12.5px;color:var(--tx2);min-height:18px}
+.status.ok{color:var(--ok)} .status.bad{color:var(--bad)}
+.hintbox{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-size:12.5px;color:var(--tx2)}
+.hintbox b{color:var(--tx)}
+table.kv{border-collapse:collapse;font-size:12.5px;color:var(--tx2)}
+table.kv td{padding:3px 10px 3px 0;vertical-align:top}
+table.kv td:first-child{color:var(--acc2);white-space:nowrap;font-weight:600}
+hr.s{border:none;border-top:1px solid var(--line);margin:14px 0}
+#ngThumb{width:100%;max-height:180px;object-fit:contain;background:#0d1015;border:1px solid var(--line);border-radius:10px}
+
+/* ---------- start modal ---------- */
+#mStart .panel{text-align:center;width:min(480px,94vw)}
+#mStart .logo{font-size:26px;font-weight:800;letter-spacing:.5px;margin:6px 0 2px}
+#mStart .logo span{color:var(--acc)}
+#mStart .tag{color:var(--tx2);font-size:13px;margin-bottom:18px}
+#mStart .col{text-align:left}
+
+/* ---------- toasts ---------- */
+#toasts{position:fixed;left:50%;bottom:52px;transform:translateX(-50%);display:flex;flex-direction:column;
+  gap:6px;z-index:80;pointer-events:none;align-items:center}
+.toast{background:rgba(24,29,38,.94);border:1px solid var(--line);border-left:3px solid var(--acc);
+  color:var(--tx);padding:9px 15px;border-radius:10px;font-size:13px;box-shadow:0 8px 30px rgba(0,0,0,.4);
+  animation:tin .18s ease-out;max-width:86vw}
+.toast.err{border-left-color:var(--bad)} .toast.ok{border-left-color:var(--ok)}
+@keyframes tin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+
+/* ---------- solved overlay ---------- */
+#mSolved .panel{text-align:center;width:min(430px,94vw)}
+#mSolved .big{font-size:30px;font-weight:800;color:var(--acc);margin:8px 0 2px}
+@media (max-width:760px){
+  .brand small{display:none}
+  .b{padding:9px 11px}
+  #hint{display:none}
+}
+</style>
+</head>
+<body>
+<canvas id="board"></canvas>
+
+<div class="topbar">
+  <div class="brand">Jigsaw Together<small>serverless co-op</small></div>
+  <div class="chip" id="playersChip" title="Connected players">
+    <span class="dot" id="netDot"></span><span id="playersTxt">solo</span><span class="pdots" id="playerDots"></span>
+  </div>
+  <button class="b" id="bInvite">Invite</button>
+  <button class="b" id="bJoin">Join</button>
+  <button class="b" id="bNew">New game</button>
+  <button class="b" id="bPic">Picture</button>
+  <button class="b" id="bShuffle">Shuffle</button>
+  <button class="b" id="bSound">Sound: on</button>
+  <button class="b" id="bHelp">?</button>
+</div>
+
+<div id="hint">drag pieces &middot; wheel = zoom &middot; middle button = pan &middot; pieces snap to friends and to the frame</div>
+<div id="zoomBox">
+  <button class="b" id="zoomOut" title="Zoom out">&minus;</button>
+  <button class="b" id="zoomIn" title="Zoom in">+</button>
+</div>
+<input type="file" id="file" accept="image/*" hidden>
+
+<!-- start -->
+<div class="modal on" id="mStart"><div class="panel">
+  <div class="logo">Jigsaw <span>Together</span></div>
+  <div class="tag">A jigsaw puzzle you solve together. One file, no server, no accounts.<br>
+    Players connect directly, peer-to-peer, via invite codes.</div>
+  <div class="col">
+    <label class="f">Your nickname
+      <input type="text" id="nameIn" maxlength="18" autocomplete="nickname">
+    </label>
+    <button class="b acc" id="bStartNew">Start a new session</button>
+    <button class="b" id="bStartJoin">Join a session with a code</button>
+    <button class="b" id="bContinue" hidden>Continue last session</button>
+  </div>
+  <p style="margin-top:14px">Everything runs in your browser. The picture and the game live only on the
+  players' devices and are shared directly between them.</p>
+</div></div>
+
+<!-- invite (shown on the side of an existing player) -->
+<div class="modal" id="mInvite"><div class="panel">
+  <button class="x" data-close>&times;</button>
+  <h2>Invite a player</h2>
+  <p>Codes are exchanged through any channel you like (chat, e-mail, messenger, paper).</p>
+  <div class="step"><div class="stepn">1</div><div style="flex:1">
+    <p style="margin:0 0 6px">Send this <b>invite code</b> to the player who wants to join:</p>
+    <textarea class="code" id="invOffer" readonly placeholder="Generating invite code&hellip;"></textarea>
+    <div class="row" style="margin-top:6px"><button class="b" id="bInvCopy">Copy code</button>
+    <button class="b" id="bInvLink">Copy as link</button></div>
+  </div></div>
+  <div class="step"><div class="stepn">2</div><div style="flex:1">
+    <p style="margin:0 0 6px">Paste the <b>reply code</b> they send back, then connect:</p>
+    <textarea class="code" id="invAnswer" placeholder="Paste reply code here"></textarea>
+    <div class="row" style="margin-top:6px">
+      <button class="b acc" id="bInvConnect">Connect</button><span class="status" id="invStatus"></span>
+    </div>
+  </div></div>
+  <div class="hintbox">The newcomer will receive the current board and picture automatically.
+  After that first handshake all players link to each other directly (mesh), with no relay.</div>
+</div></div>
+
+<!-- join (shown on the newcomer side) -->
+<div class="modal" id="mJoin"><div class="panel">
+  <button class="x" data-close>&times;</button>
+  <h2>Join a session</h2>
+  <div class="step"><div class="stepn">1</div><div style="flex:1">
+    <p style="margin:0 0 6px">Paste the <b>invite code</b> you received:</p>
+    <textarea class="code" id="joinOffer" placeholder="JT1.&hellip;"></textarea>
+    <div class="row" style="margin-top:6px"><button class="b acc" id="bJoinGen">Generate reply</button>
+    <span class="status" id="joinStatus1"></span></div>
+  </div></div>
+  <div class="step"><div class="stepn">2</div><div style="flex:1">
+    <p style="margin:0 0 6px">Send this <b>reply code</b> back to the sender:</p>
+    <textarea class="code" id="joinReply" readonly placeholder="Your reply will appear here"></textarea>
+    <div class="row" style="margin-top:6px"><button class="b" id="bJoinCopy">Copy reply</button></div>
+  </div></div>
+  <p>As soon as they confirm, you will be connected directly and the current board
+  will be synced to you automatically.</p>
+</div></div>
+
+<!-- new game -->
+<div class="modal" id="mNew"><div class="panel">
+  <button class="x" data-close>&times;</button>
+  <h2>New game</h2>
+  <p>Pick how many pieces go along the picture's <b>shorter side</b> &mdash;
+  the other side, the piece count and the world size all follow from the
+  picture's own shape, so pieces always stay square. Everyone connected
+  follows automatically.</p>
+  <img id="ngThumb" alt="Puzzle picture preview">
+  <div class="row" style="margin:10px 0 2px">
+    <button class="b" id="bNgPick">Choose picture&hellip;</button>
+    <span class="status" id="ngFileName"></span>
+  </div>
+  <div class="row" style="margin:8px 0">
+    <label class="f">Pieces on shorter side
+      <select id="ngShort"></select></label>
+    <label class="f" style="justify-content:flex-end">&nbsp;
+      <span id="ngCount" style="color:var(--tx);font-size:14px"></span></label>
+  </div>
+  <div class="row end"><button class="b acc" id="bNgCreate">Create &amp; shuffle</button></div>
+</div></div>
+
+<!-- help -->
+<div class="modal" id="mHelp"><div class="panel">
+  <button class="x" data-close>&times;</button>
+  <h2>How it works</h2>
+  <h3>Playing</h3>
+  <p>Drag pieces with the mouse or finger. Wheel / pinch zooms. With a mouse, the table pans
+  only while the <b>middle mouse button</b> is held; on touch screens drag with one finger
+  or pinch. A piece glows in a player's colour while they hold it &mdash; only one player can
+  hold a group at a time. Pieces snap to each other when the fit is close, and to the frame
+  when they reach their place.</p>
+  <p>Your board is saved automatically in this browser &mdash; close the tab any time and press
+  <b>Continue last session</b> on the next visit to pick up exactly where you left off
+  (pieces, picture and view are all kept on this device).</p>
+  <h3>Multiplayer without a server</h3>
+  <table class="kv">
+    <tr><td>Invite</td><td>Any player presses <b>Invite</b> and sends the code to a friend; the friend sends a reply code back. That single exchange is the whole signup.</td></tr>
+    <tr><td>Mesh</td><td>Right after joining, players introduce each other to everyone else and the session becomes a full peer-to-peer mesh of WebRTC channels. There is no host and no relay.</td></tr>
+    <tr><td>Session life</td><td>The session exists as long as at least one player keeps the page open. Everyone can leave and come back with a fresh invite at any time; late joiners receive the full board state.</td></tr>
+    <tr><td>Live moves</td><td>While you drag, piece positions stream to everyone ~30 times per second and are interpolated, so pieces glide on remote screens.</td></tr>
+    <tr><td>Locks</td><td>Grabbing a group locks it instantly. Two players grabbing the same group at the same moment resolve deterministically (earliest logical clock, then player id) &mdash; the loser feels the piece pulled away.</td></tr>
+    <tr><td>Picture</td><td>The image travels peer-to-peer in hash-checked chunks &mdash; it never touches any server.</td></tr>
+  </table>
+  <h3>Network notes</h3>
+  <p>Connections are direct browser-to-browser (WebRTC). Public STUN servers are used only to discover
+  your address when players are behind different routers; on the same network the app works fully offline.
+  Some very restrictive corporate NATs can still block direct links (no TURN relay is used by design).</p>
+  <h3>Protocol in one table</h3>
+  <table class="kv">
+    <tr><td>hi / bye</td><td>greet / leave on a channel</td></tr>
+    <tr><td>st_req &rarr; st</td><td>newcomer asks, peers answer, first snapshot wins</td></tr>
+    <tr><td>gb / m / dp</td><td>grab (lock) / motion stream / drop with snap result</td></tr>
+    <tr><td>dn</td><td>grab conflict: cancel your drag</td></tr>
+    <tr><td>rq / iq / so / sa</td><td>relayed introductions that complete the mesh</td></tr>
+    <tr><td>need_img &rarr; chunks</td><td>picture transfer, 16 KB frames, hash-verified</td></tr>
+    <tr><td>hb</td><td>heartbeat every 4 s; 12 s silence = left</td></tr>
+  </table>
+</div></div>
+
+<!-- solved -->
+<div class="modal" id="mSolved"><div class="panel">
+  <div class="big">Solved!</div>
+  <p id="solvedStats"></p>
+  <div class="row" style="justify-content:center">
+    <button class="b" id="bSolvedClose">Admire it</button>
+    <button class="b acc" id="bSolvedNew">New game</button>
+  </div>
+</div></div>
+
+<div id="toasts"></div>
+<script>
+'use strict';
+/* ==========================================================================
+   PART 2 — utilities, sound, jigsaw geometry
+   ========================================================================== */
+
+const $ = s => document.querySelector(s);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const now = () => performance.now();
+const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+
+function uid(len = 9){
+  let s = '';
+  const abc = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  for(let i = 0; i < len; i++) s += abc[(Math.random() * abc.length) | 0];
+  return s;
+}
+
+/* ---- deterministic hashing / rng ---- */
+function fnv1a(str, seed = 0x811c9dc5){
+  let h = seed >>> 0;
+  for(let i = 0; i < str.length; i++){ h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return h >>> 0;
+}
+function hashBytes(u8){
+  let h1 = 0x811c9dc5 >>> 0, h2 = 0x019d5c1d >>> 0;
+  for(let i = 0; i < u8.length; i++){
+    h1 = Math.imul(h1 ^ u8[i], 16777619) >>> 0;
+    h2 = (Math.imul(h2 + u8[i], 2246822519) >>> 0) ^ (h2 >>> 7);
+  }
+  return h1.toString(36) + '.' + h2.toString(36);
+}
+function mulberry(seed){
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* ---- identity: names & colours ---- */
+const PALETTE = ['#ef5350','#5fb96e','#4aa3e8','#e8b34b','#ab63d6','#38bdb8','#f07a4b','#8fc74a','#e46faa','#8d7cf0'];
+const ADJ = ['Swift','Calm','Bold','Clever','Lucky','Brave','Quiet','Nimble','Jolly','Witty','Noble','Sunny','Frosty','Merry','Daring','Gentle'];
+const ANIMAL = ['Fox','Otter','Panda','Lynx','Heron','Gecko','Moose','Crow','Hare','Wolf','Seal','Ibex','Cat','Owl','Elk','Bee'];
+function randomName(){ return ADJ[(Math.random()*ADJ.length)|0] + ANIMAL[(Math.random()*ANIMAL.length)|0]; }
+function colorOf(id){ return PALETTE[fnv1a('c:' + id) % PALETTE.length]; }
+
+/* ---- base64url (chunk-safe) ---- */
+function b64uEnc(bytes){
+  let bin = '';
+  for(let i = 0; i < bytes.length; i += 0x8000)
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function b64uDec(str){
+  str = str.replace(/-/g, '+').replace(/_/g, '/');
+  while(str.length % 4) str += '=';
+  const bin = atob(str), out = new Uint8Array(bin.length);
+  for(let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/* ---- invite-code codec: JSON -> deflate-raw -> base64url ----
+   Uses the browser-native CompressionStream (no libraries). Falls back to
+   plain base64 (tag JT0) on older engines. */
+async function encodeCode(obj){
+  const raw = new TextEncoder().encode(JSON.stringify(obj));
+  if(typeof CompressionStream === 'function'){
+    try{
+      const cs = new CompressionStream('deflate-raw');
+      const w = cs.writable.getWriter(); w.write(raw); w.close();
+      const buf = await new Response(cs.readable).arrayBuffer();
+      return 'JT1.' + b64uEnc(new Uint8Array(buf));
+    }catch(e){ /* fall through */ }
+  }
+  return 'JT0.' + b64uEnc(raw);
+}
+async function decodeCode(str){
+  str = (str || '').trim().replace(/\s+/g, '');
+  const dot = str.indexOf('.');
+  if(dot < 1) throw new Error('Not a Jigsaw Together code');
+  const tag = str.slice(0, dot), body = b64uDec(str.slice(dot + 1));
+  let json;
+  if(tag === 'JT1'){
+    const ds = new DecompressionStream('deflate-raw');
+    const r = new Response(new Blob([body]).stream().pipeThrough(ds));
+    json = new TextDecoder().decode(await r.arrayBuffer());
+  }else if(tag === 'JT0'){
+    json = new TextDecoder().decode(body);
+  }else throw new Error('Unknown code version: ' + tag);
+  const obj = JSON.parse(json);
+  if(!obj || !obj.sdp || (obj.t !== 'o' && obj.t !== 'a')) throw new Error('Malformed code payload');
+  return obj;
+}
+
+/* ---- toasts ---- */
+function toast(msg, kind = '', ms = 2600){
+  const el = document.createElement('div');
+  el.className = 'toast' + (kind ? ' ' + kind : '');
+  el.textContent = msg;
+  $('#toasts').appendChild(el);
+  setTimeout(() => { el.style.transition = 'opacity .3s'; el.style.opacity = '0';
+    setTimeout(() => el.remove(), 320); }, ms);
+}
+function copyText(text, btn){
+  const done = ok => toast(ok ? 'Copied to clipboard' : 'Press Ctrl+C to copy', ok ? 'ok' : 'err');
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(() => done(true), () => fallbackCopy(text, done));
+  } else fallbackCopy(text, done);
+}
+function fallbackCopy(text, done){
+  try{
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove(); done(ok);
+  }catch(e){ done(false); }
+}
+
+/* ---- tiny synthesised sounds (no audio files) ---- */
+const SFX = {
+  ctx: null, on: true,
+  ensure(){
+    if(!this.ctx){
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if(!AC) return null;
+      this.ctx = new AC();
+    }
+    if(this.ctx.state === 'suspended') this.ctx.resume();
+    return this.ctx;
+  },
+  blip(freq, dur = 0.07, type = 'sine', gain = 0.12, slide = 0, when = 0){
+    if(!this.on) return;
+    const c = this.ensure(); if(!c) return;
+    try{
+      const t0 = c.currentTime + when;
+      const o = c.createOscillator(), g = c.createGain();
+      o.type = type; o.frequency.setValueAtTime(freq, t0);
+      if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(40, freq + slide), t0 + dur);
+      g.gain.setValueAtTime(0, t0);
+      g.gain.linearRampToValueAtTime(gain, t0 + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.0008, t0 + dur);
+      o.connect(g); g.connect(c.destination);
+      o.start(t0); o.stop(t0 + dur + 0.03);
+    }catch(e){ /* audio is optional */ }
+  },
+  pick(){ this.blip(540, 0.05, 'triangle', 0.10, 120); },
+  drop(){ this.blip(330, 0.06, 'triangle', 0.10, -60); },
+  snap(){ this.blip(620, 0.05, 'square', 0.07); this.blip(930, 0.07, 'square', 0.06, 0, 0.055); },
+  deny(){ this.blip(150, 0.14, 'sawtooth', 0.10, -50); },
+  join(){ this.blip(440, 0.07, 'sine', 0.09, 0, 0); this.blip(660, 0.08, 'sine', 0.09, 0, 0.07); },
+  leave(){ this.blip(520, 0.09, 'sine', 0.08, -180); },
+  win(){ [523, 659, 784, 1047].forEach((f, i) => this.blip(f, 0.16, 'triangle', 0.11, 0, i * 0.09)); }
+};
+
+/* ==========================================================================
+   JIGSAW GEOMETRY — unique interlocking edges from a seed.
+   Every interior edge of the grid gets its own randomly generated knob
+   (position / size / neck / wobble), derived deterministically from
+   (seed, row, col, orientation). Both adjacent pieces build their outline
+   from the SAME world-space polyline, so shapes are perfectly complementary
+   and every player (and every late joiner) generates identical pieces.
+   ========================================================================== */
+
+function cubicPt(p0, p1, p2, p3, t){
+  const u = 1 - t, a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
+  return [a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0],
+          a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1]];
+}
+function sampleCubic(p0, p1, p2, p3, n, out){
+  for(let i = 1; i <= n; i++) out.push(cubicPt(p0, p1, p2, p3, i / n));
+}
+const CUBIC_STEPS = 9;
+
+/* returns polyline (world coords) from (x0,y0) to (x1,y1) with a unique knob */
+function makeEdge(x0, y0, x1, y1, seedStr){
+  const r1 = fnv1a(seedStr), r2 = fnv1a(seedStr + '#');
+  const R = mulberry(r1 ^ r2);
+  const tab  = 0.21 + R() * 0.06;   // knob height (fraction of edge length)
+  const mid  = 0.40 + R() * 0.20;   // knob centre position
+  const neck = 0.12 + R() * 0.05;   // half width of knob neck
+  const wob  = (R() - 0.5) * 0.03;  // slight waviness of the flat parts
+  const dir  = R() < 0.5 ? 1 : -1;  // which side the knob bulges to
+  const ux = x1 - x0, uy = y1 - y0;               // along the edge
+  const px = -uy, py = ux;                        // perpendicular (same length)
+  const P = (u, v) => [x0 + ux * u + px * v, y0 + uy * u + py * v];
+  const pts = [P(0, 0)];
+  const A = P(mid - neck, 0), B = P(mid, -tab * dir), C = P(mid + neck, 0);
+  sampleCubic(P(0, 0), P(0.22, wob * 0.4), P(mid - neck * 1.7, 0.015), A, CUBIC_STEPS, pts);
+  sampleCubic(A, P(mid - neck, -tab * 0.62 * dir), P(mid - neck * 0.4, -tab * dir), B, CUBIC_STEPS, pts);
+  sampleCubic(B, P(mid + neck * 0.4, -tab * dir), P(mid + neck, -tab * 0.62 * dir), C, CUBIC_STEPS, pts);
+  sampleCubic(C, P(mid + neck * 1.7, -0.015), P(0.78, -wob * 0.4), P(1, 0), CUBIC_STEPS, pts);
+  return pts;
+}
+
+/* Build every runtime piece for the current S.puzzle (+ optional picture).
+   Pieces are keyed by id = row*cols+col. Geometry is pure; the picture only
+   paints the pixels, so a joiner sees grey placeholders until it arrives. */
+function buildPieces(){
+  const P = S.puzzle;
+  const { cols, rows, W, H, seed } = P;
+  const cw = W / cols, ch = H / rows;
+  P.cw = cw; P.ch = ch;
+  const pad = Math.ceil(Math.max(cw, ch) * 0.34);
+  P.pad = pad;
+
+  // shared edges: EV[r][c] vertical edge between (r,c-1|r) at x=c*cw
+  const EV = [], EH = [];
+  for(let r = 0; r < rows; r++){
+    EV[r] = [];
+    for(let c = 1; c < cols; c++)
+      EV[r][c] = makeEdge(c * cw, r * ch, c * cw, (r + 1) * ch, `e|${seed}|v|${r}|${c}`);
+  }
+  for(let r = 1; r < rows; r++){
+    EH[r] = [];
+    for(let c = 0; c < cols; c++)
+      EH[r][c] = makeEdge(c * cw, r * ch, (c + 1) * cw, r * ch, `e|${seed}|h|${r}|${c}`);
+  }
+
+  const hit = buildPieces._hit || (buildPieces._hit = document.createElement('canvas').getContext('2d'));
+  const q = 2; // supersample factor for crisp zoomed pieces
+  const old = S.pieces;
+  S.pieces = new Map();
+
+  for(let r = 0; r < rows; r++){
+    for(let c = 0; c < cols; c++){
+      const id = r * cols + c;
+      const pts = [];
+      const push = (arr, rev) => { if(rev) for(let i = arr.length - 1; i >= 0; i--) pts.push(arr[i]); else for(const p of arr) pts.push(p); };
+      const edge = (arr, rev) => { if(arr) push(arr, rev); };
+
+      // top: left -> right
+      if(r === 0) edge([[c * cw, 0], [(c + 1) * cw, 0]]);
+      else edge(EH[r][c], false);
+      // right: top -> bottom
+      if(c === cols - 1) edge([[(c + 1) * cw, r * ch], [(c + 1) * cw, (r + 1) * ch]]);
+      else edge(EV[r][c + 1], false);
+      // bottom: right -> left
+      if(r === rows - 1) edge([[(c + 1) * cw, (r + 1) * ch], [c * cw, (r + 1) * ch]]);
+      else edge(EH[r + 1][c], true);
+      // left: bottom -> top
+      if(c === 0) edge([[c * cw, (r + 1) * ch], [c * cw, r * ch]]);
+      else edge(EV[r][c], true);
+
+      const path = new Path2D();
+      pts.forEach((p, i) => {
+        const x = p[0] - c * cw + pad, y = p[1] - r * ch + pad;
+        if(i === 0) path.moveTo(x, y); else path.lineTo(x, y);
+      });
+      path.closePath();
+
+      const prev = old.get(id);
+      const piece = {
+        id, gx: c, gy: r,
+        home: { x: c * cw, y: r * ch },
+        x: prev ? prev.x : c * cw, y: prev ? prev.y : r * ch,
+        g: prev ? prev.g : id, z: prev ? prev.z : id + 1,
+        pad, path, w: cw + 2 * pad, h: ch + 2 * pad, el: null
+      };
+      piece.el = renderPieceCanvas(piece, q);
+      S.pieces.set(id, piece);
+    }
+  }
+  S.zTop = Math.max(S.zTop, S.pieces.size + 1);
+}
+
+/* paints one piece into its own small canvas (picture or placeholder)
+   piece.path is in CANVAS-LOCAL coordinates (buildPieces already shifted it
+   by +pad), so clip FIRST; the translate below only places the picture so
+   that world (gx*cw - pad, gy*ch - pad) lands on canvas pixel (0,0). */
+function renderPieceCanvas(piece, q = 2){
+  const P = S.puzzle;
+  const cv = document.createElement('canvas');
+  cv.width = Math.ceil(piece.w * q); cv.height = Math.ceil(piece.h * q);
+  const ctx = cv.getContext('2d');
+  ctx.scale(q, q);
+  ctx.save();
+  ctx.clip(piece.path);
+  ctx.save();
+  ctx.translate(piece.pad - piece.gx * P.cw, piece.pad - piece.gy * P.ch);
+  if(S.img){
+    ctx.drawImage(S.img.img, 0, 0, S.img.w, S.img.h, 0, 0, P.W, P.H);
+  }else{
+    ctx.fillStyle = '#3a4250';
+    ctx.fillRect(0, 0, P.W, P.H);
+    ctx.fillStyle = '#2e3542';
+    if(((piece.gx ^ piece.gy) & 1) === 0) ctx.fillRect(0, 0, P.W, P.H);
+  }
+  ctx.restore();
+  // inner bevel for depth (the clip keeps only the inside half of the stroke)
+  ctx.lineWidth = 2.4; ctx.strokeStyle = 'rgba(0,0,0,.34)'; ctx.stroke(piece.path);
+  ctx.lineWidth = 1.1; ctx.strokeStyle = 'rgba(255,255,255,.22)';
+  ctx.save(); ctx.translate(0, -0.8); ctx.stroke(piece.path); ctx.restore();
+  ctx.restore();
+  return cv;
+}
+function repaintPieces(){ // re-paint all piece canvases (e.g. new picture, same layout)
+  if(!S.puzzle) return;
+  for(const p of S.pieces.values()) p.el = renderPieceCanvas(p, 2);
+}
+
+/* ---- picture loading; bytes are canonical (hash = hash of original bytes) */
+function loadImageFromBytes(bytes, name){
+  return new Promise((resolve, reject) => {
+    const blob = new Blob([bytes]);
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => { resolve({ img, w: img.naturalWidth, h: img.naturalHeight, bytes, name: name || 'picture' }); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Cannot decode picture')); };
+    img.src = url;
+  });
+}
+function readAsArrayBuffer(file){
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(new Uint8Array(fr.result));
+    fr.onerror = () => reject(new Error('Cannot read file'));
+    fr.readAsArrayBuffer(file);
+  });
+}
+
+/* ---- default artwork: a procedurally painted landscape, so the app is
+        playable the moment it is opened ---- */
+function makeDefaultArt(){
+  const w = 1280, h = 960;
+  const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+  const x = cv.getContext('2d');
+  const R = mulberry(20260207);
+
+  const sky = x.createLinearGradient(0, 0, 0, h * 0.62);
+  sky.addColorStop(0, '#2b3a67'); sky.addColorStop(0.55, '#7a5390'); sky.addColorStop(1, '#e8927c');
+  x.fillStyle = sky; x.fillRect(0, 0, w, h * 0.62);
+
+  // stars
+  x.fillStyle = 'rgba(255,255,255,.8)';
+  for(let i = 0; i < 90; i++){ const sx = R() * w, sy = R() * h * 0.3, r = R() * 1.6 + 0.3;
+    x.globalAlpha = 0.25 + R() * 0.6; x.beginPath(); x.arc(sx, sy, r, 0, 7); x.fill(); }
+  x.globalAlpha = 1;
+
+  // sun
+  const sunX = w * 0.68, sunY = h * 0.42;
+  const gl = x.createRadialGradient(sunX, sunY, 10, sunX, sunY, 190);
+  gl.addColorStop(0, 'rgba(255,214,140,.95)'); gl.addColorStop(1, 'rgba(255,214,140,0)');
+  x.fillStyle = gl; x.beginPath(); x.arc(sunX, sunY, 190, 0, 7); x.fill();
+  x.fillStyle = '#ffd98f'; x.beginPath(); x.arc(sunX, sunY, 62, 0, 7); x.fill();
+
+  // clouds
+  x.fillStyle = 'rgba(255,255,255,.16)';
+  for(let i = 0; i < 7; i++){
+    const cx = R() * w, cy = h * (0.08 + R() * 0.3), s = 60 + R() * 130;
+    x.beginPath();
+    x.ellipse(cx, cy, s, s * 0.28, 0, 0, 7);
+    x.ellipse(cx + s * 0.5, cy + 8, s * 0.6, s * 0.2, 0, 0, 7);
+    x.fill();
+  }
+
+  // mountain ridges
+  const ridge = (baseY, ampl, col) => {
+    x.fillStyle = col; x.beginPath(); x.moveTo(0, h);
+    let px = 0, py = baseY + (R() - 0.5) * ampl;
+    x.lineTo(0, py);
+    while(px < w){
+      const nx = px + 90 + R() * 150;
+      const ny = baseY + (R() - 0.5) * ampl;
+      x.quadraticCurveTo(px + (nx - px) / 2, Math.min(py, ny) - ampl * 0.5, nx, ny);
+      px = nx; py = ny;
+    }
+    x.lineTo(w, h); x.closePath(); x.fill();
+  };
+  ridge(h * 0.52, 90, '#5a4a7a');
+  ridge(h * 0.58, 70, '#473a63');
+
+  // sea
+  const sea = x.createLinearGradient(0, h * 0.6, 0, h);
+  sea.addColorStop(0, '#31456e'); sea.addColorStop(1, '#1d2c4a');
+  x.fillStyle = sea; x.fillRect(0, h * 0.6, w, h * 0.4);
+  x.strokeStyle = 'rgba(255,214,140,.35)'; x.lineWidth = 3;
+  for(let i = 0; i < 22; i++){
+    const ry = h * 0.63 + R() * h * 0.34, rw = 40 + R() * 150, rx = sunX - rw / 2 + (R() - 0.5) * 90;
+    x.beginPath(); x.moveTo(rx, ry); x.lineTo(rx + rw, ry); x.stroke();
+  }
+
+  // foreground hills with trees
+  x.fillStyle = '#15231c';
+  x.beginPath(); x.moveTo(0, h);
+  x.quadraticCurveTo(w * 0.25, h * 0.78, w * 0.5, h * 0.86);
+  x.quadraticCurveTo(w * 0.78, h * 0.94, w, h * 0.8);
+  x.lineTo(w, h); x.closePath(); x.fill();
+  x.fillStyle = '#0e1a14';
+  for(let i = 0; i < 26; i++){
+    const tx = R() * w, ty = h * (0.84 + R() * 0.13), ts = 16 + R() * 30;
+    x.beginPath(); x.moveTo(tx, ty - ts * 1.6); x.lineTo(tx + ts * 0.55, ty); x.lineTo(tx - ts * 0.55, ty);
+    x.closePath(); x.fill();
+  }
+
+  // birds
+  x.strokeStyle = 'rgba(20,24,34,.85)'; x.lineWidth = 3; x.lineCap = 'round';
+  for(let i = 0; i < 5; i++){
+    const bx = w * (0.15 + R() * 0.6), by = h * (0.12 + R() * 0.25), bs = 8 + R() * 10;
+    x.beginPath(); x.arc(bx - bs, by, bs, -Math.PI * 0.85, -Math.PI * 0.15);
+    x.arc(bx + bs, by, bs, -Math.PI * 0.85, -Math.PI * 0.15); x.stroke();
+  }
+
+  // export: PNG bytes + decoded image
+  return new Promise(res => cv.toBlob(async b => {
+    const buf = new Uint8Array(await b.arrayBuffer());
+    res({ bytes: buf, blob: b });
+  }, 'image/png'));
+}
+/* ==========================================================================
+   PART 3 — game state, camera, renderer, input, snapping
+   ========================================================================== */
+
+const S = {
+  me: { id: uid(), name: randomName(), color: '' },
+  puzzle: null,          // def {seed, cols, rows, W, H, imgHash, imgName} + derived cw/ch/pad
+  pieces: new Map(),     // id -> piece {id,gx,gy,home,x,y,g,z,el,path,pad,w,h}
+  locks: new Map(),      // gid -> {peer, clk}
+  players: new Map(),    // id -> {name, lastSeen}  (me + everyone ever met)
+  clk: 1, zTop: 1,       // Lamport clock / topmost z
+  img: null,             // {img, w, h} decoded picture for rendering
+  imgBytes: null, imgName: '', imgHash: '',
+  started: false, solved: false, solvedShown: false, startedAt: 0
+};
+S.me.color = colorOf(S.me.id);
+
+const hitCtx = document.createElement('canvas').getContext('2d');
+
+function membersOf(g){
+  const out = [];
+  for(const p of S.pieces.values()) if(p.g === g) out.push(p);
+  return out;
+}
+function translateGroup(g, dx, dy){ for(const p of membersOf(g)){ p.x += dx; p.y += dy; } }
+function raiseGroup(g, z){ for(const p of membersOf(g)) p.z = z; }
+function setGroupAnchor(g, ax, ay){
+  const a = S.pieces.get(g); if(!a) return;
+  translateGroup(g, ax - a.x, ay - a.y);
+}
+
+/* ---------------- camera ---------------- */
+const cvp = $('#board');
+const ctx = cvp.getContext('2d');
+let vw = 0, vh = 0, dpr = 1;
+const cam = { x: 0, y: 0, s: 1 };
+function resize(){
+  dpr = Math.min(2.5, window.devicePixelRatio || 1);
+  vw = window.innerWidth; vh = window.innerHeight;
+  if(cvp.width !== Math.round(vw * dpr) || cvp.height !== Math.round(vh * dpr)){
+    cvp.width = Math.round(vw * dpr); cvp.height = Math.round(vh * dpr);
+  }
+  cvp.style.width = vw + 'px'; cvp.style.height = vh + 'px';
+}
+window.addEventListener('resize', resize);
+
+function s2w(sx, sy){ return { x: (sx - vw / 2) / cam.s + cam.x, y: (sy - vh / 2) / cam.s + cam.y }; }
+function w2s(wx, wy){ return { x: (wx - cam.x) * cam.s + vw / 2, y: (wy - cam.y) * cam.s + vh / 2 }; }
+function worldBounds(){
+  const P = S.puzzle || { W: 1200, H: 900 };
+  const M = Math.max(P.W, P.H) * 0.55 + 300;
+  return { x0: -M, y0: -M, x1: P.W + M, y1: P.H + M, W: P.W, H: P.H };
+}
+function fitCamera(){
+  const b = worldBounds();
+  cam.s = clamp(Math.min(vw / (b.x1 - b.x0), vh / (b.y1 - b.y0)) * 0.96, 0.12, 2.5);
+  cam.x = (b.x0 + b.x1) / 2; cam.y = (b.y0 + b.y1) / 2;
+}
+function zoomAt(sx, sy, factor){
+  const w0 = s2w(sx, sy);
+  cam.s = clamp(cam.s * factor, 0.12, 4);
+  const w1 = s2w(sx, sy);
+  cam.x += w0.x - w1.x; cam.y += w0.y - w1.y;
+}
+
+/* ---------------- picking & dragging ---------------- */
+function pickPiece(wx, wy){
+  let best = null;
+  for(const p of S.pieces.values()){
+    const lx = wx - p.x + p.pad, ly = wy - p.y + p.pad;
+    if(lx < -2 || ly < -2 || lx > p.w + 2 || ly > p.h + 2) continue;
+    if(hitCtx.isPointInPath(p.path, lx, ly)){ if(!best || p.z > best.z) best = p; }
+  }
+  return best;
+}
+
+const drag = { g: -1, ox: 0, oy: 0, lastTx: 0, snapshot: null };
+const shakeMap = new Map();   // gid -> end time of "denied" shake
+const pointers = new Map();   // pointerId -> {x, y}
+let pinch = null, panLast = null;
+
+function grabLocal(g){
+  const lk = S.locks.get(g);
+  if(lk && lk.peer !== S.me.id){ denyAnim(g); return false; }
+  const clk = ++S.clk, z = ++S.zTop;
+  S.locks.set(g, { peer: S.me.id, clk });
+  raiseGroup(g, z);
+  NET.bcast({ t: 'gb', g, clk, z });
+  SFX.pick();
+  return true;
+}
+function denyAnim(g){ shakeMap.set(g, now() + 300); SFX.deny(); }
+
+function beginDrag(piece, wx, wy){
+  if(!grabLocal(piece.g)) return false;
+  const a = S.pieces.get(piece.g);
+  drag.g = piece.g;
+  drag.ox = a.x - wx; drag.oy = a.y - wy;
+  drag.lastTx = 0;
+  drag.snapshot = membersOf(piece.g).map(p => [p.id, p.x, p.y]);
+  document.body.classList.add('dragging');
+  return true;
+}
+function moveDrag(wx, wy){
+  const a = S.pieces.get(drag.g); if(!a) return;
+  const nx = wx + drag.ox, ny = wy + drag.oy;
+  const dx = nx - a.x, dy = ny - a.y;
+  translateGroup(drag.g, dx, dy);
+  const t = now();
+  if(t - drag.lastTx > 33){ // ~30 Hz motion stream
+    drag.lastTx = t;
+    NET.bcast({ t: 'm', g: drag.g, x: a.x, y: a.y });
+  }
+}
+function endDrag(allowSnap){
+  const g = drag.g; if(g < 0) return;
+  drag.g = -1;
+  document.body.classList.remove('dragging');
+  S.locks.delete(g);
+  if(allowSnap) resolveSnap(g);
+  broadcastGroup(g);
+  SFX.drop();
+  checkSolved();
+  saveSoon();
+}
+function forceCancelDrag(g){ // we lost a grab race — put the group back
+  if(drag.g === g){
+    for(const [id, x, y] of drag.snapshot){
+      const p = S.pieces.get(id); if(p){ p.x = x; p.y = y; }
+    }
+    drag.g = -1;
+    document.body.classList.remove('dragging');
+    broadcastGroup(g);
+  }
+  S.locks.delete(g);
+  denyAnim(g);
+}
+/* send authoritative positions of a group (after drop / shuffle / cancel) */
+function broadcastGroup(g){
+  const a = S.pieces.get(g); if(!a) return;
+  const gid = a.g;
+  const ps = membersOf(gid).map(p => [p.id, Math.round(p.x * 10) / 10, Math.round(p.y * 10) / 10, p.z, p.g]);
+  NET.bcast({ t: 'dp', ps, mg: [], lk: 0 });
+}
+
+/* ---------------- snapping ---------------- */
+const snapTh = () => Math.min(S.puzzle.cw, S.puzzle.ch) * 0.30;
+
+function findSnapTarget(g){
+  const a = S.pieces.get(g); if(!a) return null;
+  const TH = snapTh();
+  if(dist(a.x, a.y, a.home.x, a.home.y) < TH) return { home: true };
+  let best = null;
+  for(const m of membersOf(g)){
+    for(const [ddx, ddy] of [[1,0],[-1,0],[0,1],[0,-1]]){
+      const nx = m.gx + ddx, ny = m.gy + ddy;
+      if(nx < 0 || ny < 0 || nx >= S.puzzle.cols || ny >= S.puzzle.rows) continue;
+      const n = S.pieces.get(ny * S.puzzle.cols + nx);
+      if(!n || n.g === g) continue;
+      const lk = S.locks.get(n.g);
+      if(lk && lk.peer !== S.me.id) continue;
+      const err = dist(n.x, n.y, m.x + n.home.x - m.home.x, m.y + n.home.y - m.home.y);
+      if(err < TH && (!best || err < best.err)) best = { err, n };
+    }
+  }
+  return best;
+}
+
+function resolveSnap(g){
+  const a = S.pieces.get(g); if(!a) return;
+  const TH = snapTh();
+  const t = findSnapTarget(g);
+  if(!t) return;
+  if(t.home){
+    setGroupAnchor(g, a.home.x, a.home.y);
+    return;
+  }
+  // merge with the neighbour's group: align exactly, unify group id
+  let anchor = null;
+  for(const mm of membersOf(g)){
+    for(const [ddx, ddy] of [[1,0],[-1,0],[0,1],[0,-1]]){
+      const nx = mm.gx + ddx, ny = mm.gy + ddy;
+      if(nx < 0 || ny < 0 || nx >= S.puzzle.cols || ny >= S.puzzle.rows) continue;
+      const n = S.pieces.get(ny * S.puzzle.cols + nx);
+      if(n && n.id === t.n.id){ anchor = { m: mm, n }; break; }
+    }
+    if(anchor) break;
+  }
+  if(!anchor) return;
+  const { m: mp, n } = anchor;
+  const corrX = (mp.x + n.home.x - mp.home.x) - n.x;
+  const corrY = (mp.y + n.home.y - mp.home.y) - n.y;
+  const ng = n.g, oldG = g;
+  for(const p of membersOf(ng)){ p.x += corrX; p.y += corrY; }
+  const newG = Math.min(oldG, ng);
+  for(const p of membersOf(oldG)) p.g = newG;
+  for(const p of membersOf(ng)) p.g = newG;
+  const lk = S.locks.get(oldG) || S.locks.get(ng);
+  S.locks.delete(oldG); S.locks.delete(ng);
+  if(lk) S.locks.set(newG, lk);
+  const z = ++S.zTop; raiseGroup(newG, z);
+  SFX.snap();
+  // after a merge the assembly may now fit the frame
+  const a2 = S.pieces.get(newG);
+  if(dist(a2.x, a2.y, a2.home.x, a2.home.y) < TH) setGroupAnchor(newG, a2.home.x, a2.home.y);
+}
+
+function checkSolved(){
+  if(!S.puzzle || S.solved) return;
+  for(const p of S.pieces.values())
+    if(Math.abs(p.x - p.home.x) > 0.6 || Math.abs(p.y - p.home.y) > 0.6) return;
+  S.solved = true;
+  SFX.win();
+  confettiBurst();
+  const secs = Math.round((Date.now() - S.startedAt) / 1000);
+  const mm = Math.floor(secs / 60), ss = String(secs % 60).padStart(2, '0');
+  const n = NET.connectedIds().length + 1;
+  $('#solvedStats').textContent =
+    `${S.puzzle.cols * S.puzzle.rows} pieces · ${mm}:${ss} · ${n} player${n > 1 ? 's' : ''}`;
+  setTimeout(() => openModal('#mSolved'), 900);
+  saveSoon();
+}
+
+/* ---------------- shuffling ---------------- */
+function scatterGroup(g){
+  const P = S.puzzle, a = S.pieces.get(g);
+  if(!a) return;
+  const M = Math.max(P.W, P.H) * 0.32;
+  const bw = P.cw + 2 * P.pad, bh = P.ch + 2 * P.pad;
+  let x = 0, y = 0;
+  for(let tries = 0; tries < 12; tries++){
+    const side = (Math.random() * 4) | 0;
+    if(side === 0){ x = -M + Math.random() * (P.W + 2 * M - bw); y = -M * 0.7 - bh + Math.random() * M * 0.5; }
+    else if(side === 1){ x = -M + Math.random() * (P.W + 2 * M - bw); y = P.H + M * 0.2 + Math.random() * M * 0.5; }
+    else if(side === 2){ x = -M * 0.8 - bw + Math.random() * M * 0.6; y = -M * 0.6 + Math.random() * (P.H + M * 0.9); }
+    else { x = P.W + M * 0.2 + Math.random() * M * 0.6; y = -M * 0.6 + Math.random() * (P.H + M * 0.9); }
+    if(Math.abs(x) > 40 || Math.abs(y) > 40) break;
+  }
+  setGroupAnchor(g, x + P.pad, y + P.pad);
+}
+function shuffleAll(){
+  if(!S.started) return;
+  const gids = new Set();
+  for(const p of S.pieces.values()){
+    const lk = S.locks.get(p.g);
+    if(!(lk && lk.peer !== S.me.id)) gids.add(p.g);
+  }
+  S.solved = false; S.solvedShown = false; S.startedAt = Date.now();
+  for(const g of gids){ scatterGroup(g); broadcastGroup(g); }
+  SFX.drop();
+  fitCamera();
+  saveSoon();
+}
+
+/* ---------------- pointer input ---------------- */
+cvp.addEventListener('pointerdown', e => {
+  SFX.ensure();
+  if(!S.started) return;
+  try{ cvp.setPointerCapture(e.pointerId); }catch(err){ /* synthetic / stale pointer ids */ }
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if(pointers.size === 2){ // pinch begins — release any drag
+    if(drag.g >= 0) endDrag(false);
+    panLast = null;
+    document.body.classList.remove('panning');
+    const pts = [...pointers.values()];
+    pinch = { d0: dist(pts[0].x, pts[0].y, pts[1].x, pts[1].y), s0: cam.s,
+              cx: (pts[0].x + pts[1].x) / 2, cy: (pts[0].y + pts[1].y) / 2,
+              wx: s2w((pts[0].x + pts[1].x) / 2, (pts[0].y + pts[1].y) / 2) };
+    return;
+  }
+  // PAN POLICY — with a mouse the table only moves while the MIDDLE button
+  // is held. Left button never pans (it is reserved for pieces), right
+  // button does nothing. Touch/pen keep the natural one-finger pan, and a
+  // two-finger pinch both zooms and pans (above).
+  const isMouse = e.pointerType === 'mouse';
+  if(isMouse && e.button !== 1 && e.button !== 0) return;   // right / other buttons: no-op
+  if((isMouse && e.button === 0) || !isMouse){              // actions that can grab pieces
+    if(panLast) return;                                     // a pan is already in progress
+    const w = s2w(e.clientX, e.clientY);
+    const hit = pickPiece(w.x, w.y);
+    if(hit){
+      const lk = S.locks.get(hit.g);
+      if(lk && lk.peer !== S.me.id){ denyAnim(hit.g); return; }
+      beginDrag(hit, w.x, w.y);
+      return;
+    }
+    if(isMouse) return;                                     // empty table + left button: no pan
+  }
+  panLast = { x: e.clientX, y: e.clientY };                 // middle mouse, or touch on empty table
+  document.body.classList.add('panning');
+});
+cvp.addEventListener('pointermove', e => {
+  const pt = pointers.get(e.pointerId);
+  if(pt){ pt.x = e.clientX; pt.y = e.clientY; }
+  if(pinch && pointers.size === 2){
+    const pts = [...pointers.values()];
+    const d = dist(pts[0].x, pts[0].y, pts[1].x, pts[1].y);
+    const cx = (pts[0].x + pts[1].x) / 2, cy = (pts[0].y + pts[1].y) / 2;
+    cam.s = clamp(pinch.s0 * d / Math.max(20, pinch.d0), 0.12, 4);
+    const w = s2w(cx, cy);
+    cam.x += pinch.wx.x - w.x; cam.y += pinch.wx.y - w.y;
+    return;
+  }
+  if(drag.g >= 0){
+    const w = s2w(e.clientX, e.clientY);
+    moveDrag(w.x, w.y);
+    return;
+  }
+  if(panLast){
+    cam.x -= (e.clientX - panLast.x) / cam.s;
+    cam.y -= (e.clientY - panLast.y) / cam.s;
+    panLast = { x: e.clientX, y: e.clientY };
+  }
+});
+function pointerEnd(e){
+  pointers.delete(e.pointerId);
+  if(pointers.size < 2) pinch = null;
+  if(drag.g >= 0){ endDrag(true); }
+  panLast = null;
+  document.body.classList.remove('panning');
+}
+cvp.addEventListener('pointerup', pointerEnd);
+cvp.addEventListener('pointercancel', pointerEnd);
+cvp.addEventListener('wheel', e => {
+  e.preventDefault();
+  zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0012));
+}, { passive: false });
+cvp.addEventListener('mousedown', e => {
+  if(e.button === 1) e.preventDefault(); // stop the browser's middle-click autoscroll
+});
+cvp.addEventListener('contextmenu', e => e.preventDefault());
+
+/* ---------------- remote motion interpolation ----------------
+   Peers stream absolute anchor positions while dragging; we ease our copy
+   of the group toward the latest target every frame. */
+function tickRemoteAnchors(dt){
+  for(const [g, an] of NET.remoteAnchors){
+    const anchor = S.pieces.get(g);
+    const lk = S.locks.get(g);
+    if(!anchor || (lk && lk.peer === S.me.id)){ NET.remoteAnchors.delete(g); continue; }
+    const k = 1 - Math.pow(0.0004, dt);
+    const nx = an.ax + (an.tx - an.ax) * k, ny = an.ay + (an.ty - an.ay) * k;
+    const dx = nx - an.ax, dy = ny - an.ay;
+    an.ax = nx; an.ay = ny;
+    translateGroup(g, dx, dy);
+  }
+}
+
+/* ---------------- confetti ---------------- */
+const fx = { parts: [] };
+function confettiBurst(){
+  const colors = PALETTE.concat(['#fff']);
+  for(let i = 0; i < 160; i++){
+    fx.parts.push({
+      x: Math.random() * vw, y: -20 - Math.random() * vh * 0.4,
+      vx: (Math.random() - 0.5) * 90, vy: 120 + Math.random() * 260,
+      rot: Math.random() * 6.3, vr: (Math.random() - 0.5) * 9,
+      c: colors[(Math.random() * colors.length) | 0],
+      w: 5 + Math.random() * 7, h: 8 + Math.random() * 8,
+      life: 3 + Math.random() * 2
+    });
+  }
+}
+
+/* ---------------- main loop ---------------- */
+let lastTs = 0;
+function frame(ts){
+  const dt = Math.min(0.05, (ts - lastTs) / 1000 || 0.016);
+  lastTs = ts;
+  resize();
+  tickRemoteAnchors(dt);
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const bg = ctx.createRadialGradient(vw * 0.5, vh * 0.42, 60, vw * 0.5, vh * 0.5, Math.max(vw, vh) * 0.85);
+  bg.addColorStop(0, '#181d26'); bg.addColorStop(1, '#0e1116');
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, vw, vh);
+
+  if(S.started && S.puzzle){
+    ctx.save();
+    ctx.translate(vw / 2, vh / 2); ctx.scale(cam.s, cam.s); ctx.translate(-cam.x, -cam.y);
+
+    const P = S.puzzle;
+    // board ghost + frame
+    ctx.globalAlpha = 0.12;
+    if(S.img) ctx.drawImage(S.img.img, 0, 0, S.img.w, S.img.h, 0, 0, P.W, P.H);
+    else { ctx.fillStyle = '#8a93a5'; ctx.fillRect(0, 0, P.W, P.H); }
+    ctx.globalAlpha = 1;
+    ctx.setLineDash([10 / cam.s, 8 / cam.s]);
+    ctx.lineWidth = 1.6 / cam.s; ctx.strokeStyle = 'rgba(255,255,255,.20)';
+    ctx.strokeRect(0, 0, P.W, P.H);
+    ctx.setLineDash([]);
+
+    // snap hint while dragging
+    let hintG = -1;
+    if(drag.g >= 0){
+      const t = findSnapTarget(drag.g);
+      if(t && !t.home) hintG = t.n.g;
+      else if(t && t.home) hintG = drag.g;
+    }
+
+    // pieces
+    const arr = [...S.pieces.values()].sort((a, b) => a.z - b.z);
+    const tNow = now();
+    for(const p of arr){
+      let sx = 0, sy = 0;
+      const sh = shakeMap.get(p.g);
+      if(sh !== undefined){
+        if(tNow > sh) shakeMap.delete(p.g);
+        else { const k = (sh - tNow) / 300; sx = Math.sin((sh - tNow) * 0.09) * 6 * k; }
+      }
+      const dragging = drag.g >= 0 && p.g === drag.g;
+      if(dragging){
+        ctx.save(); ctx.shadowColor = 'rgba(0,0,0,.5)'; ctx.shadowBlur = 18; ctx.shadowOffsetY = 8;
+        ctx.drawImage(p.el, p.x - p.pad + sx, p.y - p.pad + sy, p.w, p.h);
+        ctx.restore();
+      }else{
+        ctx.drawImage(p.el, p.x - p.pad + sx, p.y - p.pad + sy, p.w, p.h);
+      }
+    }
+
+    // lock outlines (remote-held groups + snap hint); tags drawn in screen space later
+    const tags = [];
+    ctx.lineWidth = 2.2 / cam.s;
+    for(const [g, lk] of S.locks){
+      if(lk.peer === S.me.id) continue;
+      const a = S.pieces.get(g); if(!a) continue;
+      const col = colorOf(lk.peer);
+      ctx.strokeStyle = col;
+      ctx.save(); ctx.shadowColor = col; ctx.shadowBlur = 10 / cam.s;
+      for(const p of membersOf(g)){
+        ctx.save(); ctx.translate(p.x - p.pad, p.y - p.pad); ctx.stroke(p.path); ctx.restore();
+      }
+      ctx.restore();
+      const sp = w2s(a.x + P.cw / 2, a.y - 6);
+      tags.push({ x: sp.x, y: sp.y, name: (S.players.get(lk.peer) || {}).name || 'player', color: col });
+    }
+    if(hintG >= 0 && S.pieces.has(hintG)){
+      ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.setLineDash([6 / cam.s, 5 / cam.s]);
+      for(const p of membersOf(hintG)){
+        ctx.save(); ctx.translate(p.x - p.pad, p.y - p.pad); ctx.stroke(p.path); ctx.restore();
+      }
+      ctx.setLineDash([]);
+    }
+    ctx.restore();
+
+    // player name tags over locked groups (screen space)
+    for(const t of tags) drawTag(t.x, t.y, t.name, t.color);
+  }
+  if(fx.parts.length){
+    for(const pt of fx.parts){
+      pt.life -= dt; pt.x += pt.vx * dt; pt.y += pt.vy * dt;
+      pt.vy += 240 * dt; pt.rot += pt.vr * dt;
+    }
+    fx.parts = fx.parts.filter(p => p.life > 0 && p.y < vh + 30);
+    for(const pt of fx.parts){
+      ctx.save(); ctx.translate(pt.x, pt.y); ctx.rotate(pt.rot);
+      ctx.globalAlpha = clamp(pt.life, 0, 1);
+      ctx.fillStyle = pt.c; ctx.fillRect(-pt.w / 2, -pt.h / 2, pt.w, pt.h);
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+  }
+  requestAnimationFrame(frame);
+}
+function drawTag(x, y, text, color){
+  if(!text) return;
+  ctx.save();
+  ctx.font = '600 12px system-ui, sans-serif';
+  const w = ctx.measureText(text).width + 16;
+  ctx.fillStyle = 'rgba(10,12,16,.78)';
+  ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+  const r = 9, h = 22, yy = y - h - 8;
+  ctx.beginPath();
+  ctx.moveTo(x - w / 2 + r, yy); ctx.arcTo(x + w / 2, yy, x + w / 2, yy + h, r);
+  ctx.arcTo(x + w / 2, yy + h, x - w / 2, yy + h, r); ctx.arcTo(x - w / 2, yy + h, x - w / 2, yy, r);
+  ctx.arcTo(x - w / 2, yy, x + w / 2, yy, r); ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(text, x, yy + h / 2 + 0.5);
+  ctx.restore();
+}
+
+/* ---------------- state application (snapshots & drops) ---------------- */
+function applyDrop(msg, fromId){
+  for(const row of msg.ps){
+    const p = S.pieces.get(row[0]);
+    if(p){ p.x = row[1]; p.y = row[2]; p.z = row[3]; p.g = row[4]; }
+  }
+  const fg = msg.ps.length ? msg.ps[0][4] : -1;
+  for(const gid of (msg.mg || [])){ S.locks.delete(gid); NET.remoteAnchors.delete(gid); }
+  if(msg.lk) S.locks.set(msg.lk[0], { peer: msg.lk[1], clk: msg.lk[2] });
+  else S.locks.delete(fg);
+  NET.remoteAnchors.delete(fg);
+  if(S.solved) checkSolvedStill();
+  else checkSolved();
+  saveSoon();
+}
+function checkSolvedStill(){
+  for(const p of S.pieces.values())
+    if(Math.abs(p.x - p.home.x) > 0.6 || Math.abs(p.y - p.home.y) > 0.6){ S.solved = false; break; }
+}
+
+/* full state snapshot -> local runtime (used by joins and "new game") */
+function applyState(st){
+  if(drag.g >= 0){ drag.g = -1; document.body.classList.remove('dragging'); }
+  S.clk = Math.max(S.clk, (st.clk || 1) + 1);
+  S.zTop = Math.max(S.zTop, st.zTop || 1);
+  const defChanged = !S.puzzle || JSON.stringify(S.puzzle) !== JSON.stringify(st.puzzle);
+  S.puzzle = st.puzzle;
+  const needsImg = !S.imgBytes || S.imgHash !== S.puzzle.imgHash;
+  if(defChanged || !S.pieces.size) buildPieces();
+  for(const row of st.pieces){
+    const p = S.pieces.get(row[0]);
+    if(p){ p.x = row[1]; p.y = row[2]; p.g = row[3]; p.z = row[4]; }
+  }
+  S.locks = new Map((st.locks || []).map(l => [l[0], { peer: l[1], clk: l[2] }]));
+  for(const [id, pl] of (st.players || [])){
+    if(id !== S.me.id) S.players.set(id, { name: pl.n || pl.name || 'player', lastSeen: Date.now() });
+  }
+  S.started = true; S.solved = false; S.solvedShown = false;
+  if(!S.startedAt) S.startedAt = Date.now();
+  NET.remoteAnchors.clear();
+  updateRosterUI();
+  if(needsImg) NET.requestImage();
+  else fitCamera();
+  saveSoon();
+}
+function makeState(){
+  return {
+    t: 'st', clk: S.clk, zTop: S.zTop, puzzle: S.puzzle,
+    pieces: [...S.pieces.values()].map(p => [p.id, Math.round(p.x * 10) / 10, Math.round(p.y * 10) / 10, p.g, p.z]),
+    locks: [...S.locks].map(([g, l]) => [g, l.peer, l.clk]),
+    players: [[S.me.id, { n: S.me.name }]]
+      .concat([...S.players].map(([id, pl]) => [id, { n: pl.name }]))
+  };
+}
+
+/* grid geometry from the ONLY user input: piece count along the picture's
+   SHORTER side. The long side follows from the picture's aspect ratio, so
+   cells stay square; a cap keeps absurd panoramas playable (<=3600 pieces). */
+function gridFor(short, src){
+  const n = clamp(Math.round(short) || 6, 2, 48);
+  const w = (src && src.w) || 4, h = (src && src.h) || 3;
+  const nLong = Math.min(
+    Math.max(2, Math.round(n * Math.max(w, h) / Math.min(w, h))),
+    Math.max(2, Math.floor(3600 / n)));
+  return w >= h ? { cols: nLong, rows: n } : { cols: n, rows: nLong };
+}
+
+/* start a fresh local game (creator side) */
+function newGame(opts){
+  const o = opts || {};
+  const g = gridFor(o.short !== undefined ? o.short : 6, S.img);
+  const cols = g.cols, rows = g.rows;
+  const seed = o.seed !== undefined ? o.seed : (Math.random() * 0xffffffff) >>> 0;
+  const cell = Math.max(8, Math.round(1240 / Math.max(cols, rows)));
+  const W = cell * cols, H = cell * rows;
+  S.puzzle = { seed, cols, rows, W, H, imgHash: S.imgHash, imgName: S.imgName };
+  S.locks.clear(); NET.remoteAnchors.clear();
+  S.clk++; S.zTop = 1;
+  buildPieces();
+  S.solved = false; S.solvedShown = false; S.started = true;
+  S.startedAt = Date.now();
+  const gids = new Set();
+  for(const p of S.pieces.values()) gids.add(p.id);
+  for(const g of gids) scatterGroup(g);
+  fitCamera();
+  // everyone follows: broadcast the whole new state
+  NET.bcast({ t: 'ng', st: makeState() });
+  updateRosterUI();
+  saveSoon();
+}
+/* ==========================================================================
+   PART 4 — SERVERLESS MULTIPLAYER PROTOCOL  (JTP/1)
+   ==========================================================================
+   Design goals: no server, no accounts, no relay; anyone may join or leave
+   at any time; the session dies only when the last player closes the tab;
+   realtime motion while dragging; consistent locks without a referee.
+
+   TOPOLOGY
+   ......... WebRTC DataChannels (ordered, reliable, JSON text + raw binary
+   for picture chunks). Every player keeps a direct channel to every other
+   player (full mesh). Game state is fully replicated on every peer, so
+   there is no host: any peer can serve a snapshot to a newcomer, and the
+   session outlives any individual player.
+
+   JOIN FLOW (the only manual step)
+   1. Any member M clicks Invite -> produces an invite CODE containing
+      M's SDP offer + gathered ICE candidates (deflate-raw + base64url,
+      tag "JT1"). No trickle: the code is a single self-contained string.
+   2. Newcomer N pastes the code, gets a reply CODE (SDP answer) and sends
+      it back over any channel (chat, email...).
+   3. M pastes the reply -> the M-N DataChannel opens.
+
+   MESH COMPLETION (fully automatic, still serverless)
+   4. N asks for state ("st_req"); every member answers with a staggered
+      snapshot; N applies the first one (positions, groups, locks, z-order,
+      puzzle definition, player roster).
+   5. If the picture bytes are missing, N broadcasts "need_img"; a peer
+      holding the exact hash streams it in 16 KB binary frames with
+      backpressure (bufferedAmountLow) and a checksum (fnv1a 2x32).
+   6. Each peer periodically compares "players I know" vs "channels I have"
+      and repairs the mesh: to reach P it asks any connected peer R to
+      relay an SDP offer ("rq" -> "iq" -> "so" -> "sa"). The receiver of an
+      introduction makes the offer. Duplicates are resolved by keeping the
+      first live channel per peer id. Result: everyone connects to everyone
+      with zero further manual steps.
+
+   LIVENESS
+   7. "hb" heartbeat every 4 s; 12 s of silence (or a close event) drops the
+      peer, releases the locks it held and triggers mesh repair. "bye" is
+      sent on graceful unload.
+
+   LOCKS & CONCURRENCY
+   8. Grabbing group G sends "gb {g, clk, z}". Every peer applies the same
+      rule: the claim with the smallest (Lamport clk, peer id) tuple wins.
+      The rule is commutative, so all peers converge without a referee; the
+      loser receives "dn" and its drag is cancelled back to the grab point.
+   9. While dragging, the grabber streams "m {g, x, y}" (anchor position,
+      ~30 Hz). Receivers ease their copy toward the target every frame, and
+      only accept motion from the current lock holder.
+   10. Dropping sends "dp" with authoritative positions of the whole group
+      (merging groups included). Snapping is computed by the dropper only,
+      so no snap conflicts are possible.
+
+   PUZZLE DEFINITION
+   11. A game is {seed, cols, rows, W, H, imgHash, imgName}. Edge shapes are
+       a pure function of (seed, edge coordinates), so every peer generates
+       bit-identical geometry locally; only positions ever travel.
+   ========================================================================== */
+
+const NET = {
+  peers: new Map(),          // peerId -> P {id, name, pc, dc, lastHb, tx, rx}
+  inviteP: null,             // outstanding manual invite (opener side)
+  pendingIntro: new Map(),   // peerId -> {ts, n}  rq retry pacing
+  offering: new Set(),       // peerIds with our SDP offer in flight
+  remoteAnchors: new Map(),  // gid -> {ax, ay, tx, ty} eased motion targets
+};
+
+const RTC_CFG = {
+  iceServers: [
+    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+    { urls: 'stun:stun.cloudflare.com:3478' }
+  ]
+};
+const HB_MS = 4000, HB_TIMEOUT = 12000, CHUNK = 16384;
+
+function newPc(){
+  const pc = new RTCPeerConnection(RTC_CFG);
+  pc.onconnectionstatechange = () => {
+    if(pc.connectionState === 'failed' || pc.connectionState === 'closed'){
+      for(const p of [...NET.peers.values()]) if(p.pc === pc) dropPeer(p, true);
+      if(NET.inviteP && NET.inviteP.pc === pc) NET.inviteP = null;
+    }
+  };
+  return pc;
+}
+function gathered(pc){
+  if(pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise(res => {
+    const to = setTimeout(res, 2500);
+    const ch = () => {
+      if(pc.iceGatheringState === 'complete'){
+        clearTimeout(to);
+        pc.removeEventListener('icegatheringstatechange', ch);
+        res();
+      }
+    };
+    pc.addEventListener('icegatheringstatechange', ch);
+  });
+}
+
+function openPeerStub(id){
+  let p = NET.peers.get(id);
+  if(!p){
+    p = { id, name: '?', pc: null, dc: null, lastHb: 0, tx: null, rx: null };
+    NET.peers.set(id, p);
+  }
+  return p;
+}
+function connectedPeers(){
+  const out = [];
+  for(const p of NET.peers.values()) if(p.dc && p.dc.readyState === 'open') out.push(p);
+  return out;
+}
+NET.connectedIds = () => connectedPeers().map(p => p.id);
+function isConnected(id){ return NET.connectedIds().indexOf(id) !== -1; }
+function sendTo(id, msg){
+  for(const p of connectedPeers()) if(p.id === id){
+    try{ p.dc.send(JSON.stringify(msg)); NET.sentOk = (NET.sentOk || 0) + 1; }catch(e){}
+    return true;
+  }
+  NET.sentMiss = (NET.sentMiss || 0) + 1;
+  return false;
+}
+function bcastRaw(msg){
+  for(const p of connectedPeers()){ try{ p.dc.send(JSON.stringify(msg)); }catch(e){} }
+}
+NET.bcast = bcastRaw;
+NET.remoteAnchors = NET.remoteAnchors; // (documented above)
+
+/* keep at most one live channel per peer id; returns false if duplicate */
+function registerLive(P){
+  if(!P.id) return false;
+  const ex = NET.peers.get(P.id);
+  if(ex && ex !== P && ex.dc && ex.dc.readyState === 'open'){
+    try{ P.dc.close(); }catch(e){}
+    try{ P.pc && P.pc.close(); }catch(e){}
+    return false;
+  }
+  NET.peers.set(P.id, P);
+  NET.pendingIntro.delete(P.id);
+  if(NET.inviteP === P) NET.inviteP = null; // manual handshake completed
+  updateRosterUI();
+  setTimeout(ensureMesh, 500);
+  return true;
+}
+
+function wireChannel(P, dc){
+  dc.binaryType = 'arraybuffer';
+  P.dc = dc;
+  dc.onopen = () => {
+    P.lastHb = Date.now();
+    try{ dc.send(JSON.stringify({ t: 'hi', id: S.me.id, name: S.me.name })); }catch(e){}
+    if(P.id) registerLive(P);
+    if(!S.started){ try{ dc.send(JSON.stringify({ t: 'st_req' })); }catch(e){} }
+    startHeartbeat();
+  };
+  dc.onmessage = e => {
+    P.lastHb = Date.now();
+    if(typeof e.data === 'string'){
+      let m; try{ m = JSON.parse(e.data); }catch(err){ return; }
+      handleMsg(P, m);
+    }else handleBin(P, e.data);
+  };
+  dc.onclose = () => dropPeer(P);
+  dc.onerror = () => {};
+}
+
+/* ---------------- manual invite codes ---------------- */
+async function createInvite(){
+  if(NET.inviteP) throw new Error('An invite is already being generated');
+  const pc = newPc();
+  const dc = pc.createDataChannel('jz');
+  const P = { id: null, name: '?', pc, dc, lastHb: Date.now(), tx: null, rx: null };
+  NET.inviteP = P;
+  wireChannel(P, dc);
+  await pc.setLocalDescription(await pc.createOffer());
+  await gathered(pc);
+  const code = await encodeCode({
+    t: 'o', from: S.me.id, name: S.me.name,
+    sdp: { type: pc.localDescription.type, sdp: pc.localDescription.sdp }
+  });
+  return code;
+}
+async function acceptInviteCode(code){
+  const d = await decodeCode(code);
+  if(d.t !== 'o') throw new Error('That is an invite code, not a reply');
+  const pc = newPc();
+  const P = { id: d.from, name: d.name || '?', pc, dc: null, lastHb: 0, tx: null, rx: null };
+  pc.ondatachannel = e => { P.dc = e.channel; wireChannel(P, e.channel); };
+  await pc.setRemoteDescription(d.sdp);
+  await pc.setLocalDescription(await pc.createAnswer());
+  await gathered(pc);
+  return encodeCode({
+    t: 'a', from: S.me.id, name: S.me.name,
+    sdp: { type: pc.localDescription.type, sdp: pc.localDescription.sdp }
+  });
+}
+async function completeInvite(code){
+  const d = await decodeCode(code);
+  if(d.t !== 'a') throw new Error('That is a reply code? expected reply — got invite');
+  const P = NET.inviteP;
+  if(!P || !P.pc) throw new Error('No pending invite — generate one first');
+  await P.pc.setRemoteDescription(d.sdp);
+}
+
+/* ---------------- message handling ---------------- */
+function handleMsg(P, m){
+  if(!m || typeof m !== 'object') return;
+  NET.rx = NET.rx || {};
+  NET.rx[m.t] = (NET.rx[m.t] || 0) + 1;
+
+  // relayed signalling: forward messages addressed to someone else
+  if((m.t === 'rq' || m.t === 'so' || m.t === 'sa') && m.to && m.to !== S.me.id){
+    NET.fwd = NET.fwd || { n: 0, sent: 0, noch: 0 };
+    NET.fwd.n++;
+    if(isConnected(m.to)){ NET.fwd.sent++; sendTo(m.to, m); }
+    else NET.fwd.noch++;
+    return;
+  }
+
+  switch(m.t){
+    case 'hi': {
+      P.name = (m.name || 'player').slice(0, 18);
+      P.id = m.id;
+      if(!registerLive(P)) return;
+      const isNew = !S.players.has(P.id);
+      S.players.set(P.id, { name: P.name, lastSeen: Date.now() });
+      if(isNew){ SFX.join(); toast(P.name + ' joined the session', 'ok'); }
+      updateRosterUI();
+      bcastPlayers();
+      break;
+    }
+    case 'bye':
+      if(P.id) toast((P.name || 'player') + ' left the session');
+      dropPeer(P, true);
+      break;
+    case 'hb': break;
+    case 'st_req': answerStateReq(P); break;
+    case 'st':
+      if(!S.started && m.st){ applyState(m.st); toast('Board synced — have fun', 'ok'); }
+      break;
+    case 'sync':
+      if(m.st){ applyState(m.st); toast(P.name + ' updated the game', 'ok'); }
+      break;
+    case 'need_img':
+      if(S.imgBytes && S.imgHash === m.hash) sendImageTo(P);
+      break;
+    case 'im_meta': startRxImage(P, m); break;
+    case 'im_end': finishRxImage(P, m); break;
+
+    case 'gb': { // grab (lock) request — deterministic winner everywhere
+      S.clk = Math.max(S.clk, m.clk) + 1;
+      const cur = S.locks.get(m.g);
+      const win = !cur || m.clk < cur.clk || (m.clk === cur.clk && P.id < cur.peer);
+      if(win){
+        S.locks.set(m.g, { peer: P.id, clk: m.clk });
+        S.zTop = Math.max(S.zTop, m.z || 0);
+        raiseGroup(m.g, S.zTop);
+        const a = S.pieces.get(m.g);
+        if(a) NET.remoteAnchors.set(m.g, { ax: a.x, ay: a.y, tx: a.x, ty: a.y });
+      }else{
+        try{ P.dc.send(JSON.stringify({ t: 'dn', g: m.g })); }catch(e){}
+      }
+      break;
+    }
+    case 'm': { // motion stream — only from the lock holder
+      const lk = S.locks.get(m.g);
+      if(lk && lk.peer === P.id){
+        const a = S.pieces.get(m.g);
+        let an = NET.remoteAnchors.get(m.g);
+        if(!an){
+          an = { ax: a ? a.x : m.x, ay: a ? a.y : m.y };
+          NET.remoteAnchors.set(m.g, an);
+        }
+        an.tx = m.x; an.ty = m.y;
+      }
+      break;
+    }
+    case 'dp': applyDrop(m, P.id); break;
+    case 'dn': forceCancelDrag(m.g); break;
+    case 'pr': { // roster merge — everyone learns everyone, mesh can self-complete
+      let changed = false;
+      for(const row of (m.ps || [])){
+        const id = row[0];
+        if(id === S.me.id) continue;
+        const ex = S.players.get(id);
+        if(!ex){ S.players.set(id, { name: (row[1] || 'player').slice(0, 18), lastSeen: Date.now() }); changed = true; }
+        else ex.lastSeen = Date.now();
+      }
+      if(changed){ updateRosterUI(); setTimeout(ensureMesh, 400); }
+      break;
+    }
+
+    case 'rq': { // A asks me (or asks me to forward) for an introduction to m.to
+      if(m.to === S.me.id){
+        maybeIntroOffer(m.from, P.id);
+      }else if(isConnected(m.to)){
+        sendTo(m.to, m);
+      }
+      break;
+    }
+    case 'iq': // I am asked to offer a connection to m.from
+      maybeIntroOffer(m.from, P.id);
+      break;
+    case 'so': // SDP offer for me (from m.from), delivered via m.via
+      acceptIntroOffer(P, m);
+      break;
+    case 'sa': { // SDP answer for my earlier offer
+      const T = NET.peers.get(m.from);
+      if(T && T.pc && T.pc.signalingState === 'have-local-offer'){
+        T.pc.setRemoteDescription(m.sdp).catch(() => {});
+      }
+      break;
+    }
+  }
+}
+
+/* ---------------- staggered snapshot answering ---------------- */
+function answerStateReq(P){
+  if(!S.started || !S.puzzle) return;
+  const ranks = connectedPeers().map(p => p.id).sort();
+  const rank = Math.max(0, ranks.indexOf(S.me.id));
+  setTimeout(() => {
+    if(S.started && P.dc && P.dc.readyState === 'open'){
+      try{ P.dc.send(JSON.stringify({ t: 'st', st: makeState() })); }catch(e){}
+    }
+  }, 60 + rank * 140);
+}
+
+/* ---------------- automatic mesh repair ----------------
+   pendingIntro = retry pacing for introduction REQUESTS (rq).
+   offering     = a real SDP offer is in flight for this peer; used for
+                  glare control. Glare rule: the LOWER peer id keeps its own
+                  offer, the higher id cancels and accepts the incoming one. */
+function ensureMesh(){
+  if(!S.started) return;
+  NET.meshTicks = (NET.meshTicks || 0) + 1;
+  const t = Date.now();
+  for(const [id, rec] of [...NET.pendingIntro]){
+    if(t - rec.ts > 20000) NET.pendingIntro.delete(id);
+  }
+  const connected = new Set(NET.connectedIds());
+  const relays = [...connected].sort();
+  if(!relays.length) return;
+  for(const id of S.players.keys()){
+    if(id === S.me.id || connected.has(id) || NET.offering.has(id)) continue;
+    const rec = NET.pendingIntro.get(id);
+    if(rec){
+      if(t - rec.ts < 8000) continue;
+      rec.ts = t; rec.n = (rec.n || 1) + 1;
+    }else{
+      NET.pendingIntro.set(id, { ts: t, n: 1 });
+      if(S.me.id < id) continue; // the other side initiates first
+    }
+    const relay = relays.find(r => r !== id) || relays[0];
+    sendTo(relay, { t: 'rq', to: id, from: S.me.id, name: S.me.name });
+  }
+}
+function cancelOffer(id){
+  const P = NET.peers.get(id);
+  if(P && P.pc){ try{ P.pc.close(); }catch(e){} }
+  NET.offering.delete(id);
+}
+function maybeIntroOffer(targetId, viaId){
+  if(!targetId || targetId === S.me.id || isConnected(targetId)) return;
+  if(NET.offering.has(targetId)){
+    if(S.me.id < targetId) return; // my offer wins the glare
+    cancelOffer(targetId);         // their offer wins — drop mine
+  }
+  introOffer(targetId, viaId);
+}
+async function introOffer(targetId, viaId){
+  NET.offering.add(targetId);
+  NET.offers = (NET.offers || 0) + 1;
+  try{
+    const pc = newPc();
+    const dc = pc.createDataChannel('jz');
+    const P = openPeerStub(targetId);
+    if(P.dc && P.dc.readyState === 'open'){ // raced, already connected
+      try{ pc.close(); }catch(e){}
+      NET.offering.delete(targetId);
+      return;
+    }
+    P.pc = pc; P.name = P.name || '?';
+    wireChannel(P, dc);
+    await pc.setLocalDescription(await pc.createOffer());
+    await gathered(pc);
+    sendTo(viaId, { t: 'so', to: targetId, from: S.me.id, via: viaId,
+      sdp: { type: pc.localDescription.type, sdp: pc.localDescription.sdp } });
+    setTimeout(() => {
+      if(!isConnected(targetId)) cancelOffer(targetId);
+    }, 15000);
+  }catch(e){ NET.offering.delete(targetId); }
+}
+async function acceptIntroOffer(viaP, m){
+  const from = m.from;
+  NET.answers = (NET.answers || 0) + 1;
+  if(!from || from === S.me.id || isConnected(from)) return;
+  if(NET.offering.has(from)){
+    if(S.me.id < from) return; // keep my own offer
+    cancelOffer(from);
+  }
+  try{
+    const pc = newPc();
+    const P = openPeerStub(from);
+    P.pc = pc;
+    pc.ondatachannel = e => { P.dc = e.channel; wireChannel(P, e.channel); };
+    await pc.setRemoteDescription(m.sdp);
+    await pc.setLocalDescription(await pc.createAnswer());
+    await gathered(pc);
+    sendTo(viaP.id, { t: 'sa', to: from, from: S.me.id, via: viaP.id,
+      sdp: { type: pc.localDescription.type, sdp: pc.localDescription.sdp } });
+  }catch(e){ if(NET.peers.get(from)) NET.peers.get(from).pc = null; }
+}
+
+/* ---------------- roster sharing ---------------- */
+function bcastPlayers(){
+  const ps = [...S.players].map(([id, pl]) => [id, pl.name]);
+  bcastRaw({ t: 'pr', ps });
+}
+
+/* ---------------- heartbeat / leave ---------------- */
+function startHeartbeat(){
+  if(NET.hbTimer) return;
+  NET.hbTimer = setInterval(() => {
+    const t = Date.now();
+    bcastRaw({ t: 'hb' });
+    for(const p of [...NET.peers.values()]){
+      if(p.dc && p.dc.readyState === 'open' && t - p.lastHb > HB_TIMEOUT){
+        try{ p.pc && p.pc.close(); }catch(e){}
+        try{ p.dc.close(); }catch(e){}
+        dropPeer(p);
+      }
+    }
+  }, HB_MS);
+}
+function leaveSession(){ // graceful goodbye on unload
+  bcastRaw({ t: 'bye' });
+}
+function dropPeer(P, silent){
+  if(P.id){
+    if(NET.peers.get(P.id) === P) NET.peers.delete(P.id);
+    NET.pendingIntro.delete(P.id);
+    NET.offering.delete(P.id);
+    for(const [g, lk] of [...S.locks]){
+      if(lk.peer === P.id){ S.locks.delete(g); NET.remoteAnchors.delete(g); }
+    }
+    S.players.delete(P.id);
+  }
+  P.tx = null; P.rx = null;
+  if(NET.inviteP === P) NET.inviteP = null;
+  updateRosterUI();
+  if(!silent && P.id){ toast((P.name || 'player') + ' left the session'); SFX.leave(); }
+  setTimeout(ensureMesh, 600);
+}
+
+/* ---------------- picture transfer (peer-to-peer, hash-checked) ---------------- */
+function requestImage(){
+  if(!S.puzzle || !S.puzzle.imgHash) return;
+  if(S.imgBytes && S.imgHash === S.puzzle.imgHash){ onImageReady(); return; }
+  bcastRaw({ t: 'need_img', hash: S.puzzle.imgHash });
+}
+NET.requestImage = requestImage;
+
+function sendImageTo(P){
+  if(!S.imgBytes || !P.dc || P.dc.readyState !== 'open' || P.tx) return;
+  try{
+    P.dc.send(JSON.stringify({ t: 'im_meta', hash: S.imgHash, name: S.imgName, size: S.imgBytes.length }));
+    P.tx = { i: 0, bytes: S.imgBytes };
+    pumpImage(P);
+  }catch(e){}
+}
+function pumpImage(P){
+  const dc = P.dc;
+  if(!P.tx || !dc || dc.readyState !== 'open'){ P.tx = null; return; }
+  while(P.tx.i < P.tx.bytes.length){
+    if(dc.bufferedAmount > 512 * 1024){
+      dc.bufferedAmountLowThreshold = 256 * 1024;
+      dc.onbufferedamountlow = () => { dc.onbufferedamountlow = null; pumpImage(P); };
+      return;
+    }
+    const end = Math.min(P.tx.i + CHUNK, P.tx.bytes.length);
+    try{ dc.send(P.tx.bytes.subarray(P.tx.i, end)); }catch(e){ return; }
+    P.tx.i = end;
+  }
+  P.tx = null;
+  try{ dc.send(JSON.stringify({ t: 'im_end', hash: S.imgHash })); }catch(e){}
+}
+function handleBin(P, buf){
+  if(P.rx && P.rx.parts){
+    P.rx.parts.push(buf);
+    P.rx.got += buf.byteLength;
+  }
+}
+function startRxImage(P, m){
+  if(P.rx) return;
+  if(S.imgHash === m.hash) return; // already have it
+  P.rx = { hash: m.hash, name: m.name, size: m.size, parts: [], got: 0 };
+}
+function finishRxImage(P, m){
+  const rx = P.rx; P.rx = null;
+  if(!rx || rx.hash !== m.hash) return;
+  if(rx.got !== rx.size){ toast('Picture transfer was cut short — retrying', 'err'); setTimeout(requestImage, 700); return; }
+  const total = new Uint8Array(rx.got);
+  let off = 0;
+  for(const part of rx.parts){ total.set(new Uint8Array(part), off); off += part.byteLength; }
+  if(hashBytes(total) !== rx.hash){
+    toast('Picture checksum mismatch — retrying', 'err');
+    setTimeout(requestImage, 700);
+    return;
+  }
+  applyImageBytes(total, rx.name)
+    .then(() => toast('Picture received from ' + (P.name || 'peer'), 'ok'))
+    .catch(e => toast(e.message, 'err'));
+}
+
+/* set a new picture at runtime (creator side) and let everyone follow */
+async function applyImageBytes(bytes, name){
+  const loaded = await loadImageFromBytes(bytes, name);
+  S.img = loaded;
+  S.imgBytes = bytes; S.imgName = name || 'picture';
+  S.imgHash = hashBytes(bytes);
+  if(S.puzzle && S.puzzle.imgHash && S.puzzle.imgHash !== S.imgHash){
+    S.puzzle.imgHash = S.imgHash; S.puzzle.imgName = S.imgName;
+  }
+  repaintPieces();
+  onImageReady();
+  return true;
+}
+function onImageReady(){
+  if(NET.imgTimer){ clearInterval(NET.imgTimer); NET.imgTimer = null; }
+  if(S.puzzle) fitCamera();
+  saveSoon();
+}
+/* ==========================================================================
+   PART 5 — UI wiring, boot, persistence, debug hooks
+   ========================================================================== */
+
+function openModal(sel){ $(sel).classList.add('on'); }
+function closeModal(sel){ $(sel).classList.remove('on'); }
+document.querySelectorAll('.modal [data-close]').forEach(b => {
+  b.addEventListener('click', () => closeModal('#' + b.closest('.modal').id));
+});
+document.querySelectorAll('.modal').forEach(mo => {
+  mo.addEventListener('pointerdown', e => { if(e.target === mo) closeModal('#' + mo.id); });
+});
+document.addEventListener('pointerdown', () => SFX.ensure(), { once: true });
+
+function updateRosterUI(){
+  const ids = NET.connectedIds();
+  const n = ids.length + 1;
+  $('#playersTxt').textContent = n <= 1 ? 'solo' : n + ' players';
+  $('#netDot').classList.toggle('on', ids.length > 0);
+  const dots = $('#playerDots');
+  dots.innerHTML = '';
+  for(const id of [S.me.id, ...ids].slice(0, 10)){
+    const i = document.createElement('i');
+    i.style.background = colorOf(id);
+    dots.appendChild(i);
+  }
+}
+
+/* ---------------- persistence ----------------
+   The whole session (picture bytes included, full size) lives in IndexedDB
+   and survives closing the tab or the browser. localStorage is kept as a
+   fallback (private mode, blocked IDB) and for the synchronous unload-time
+   save, where an async IDB write might not flush. Locks are NOT saved:
+   they are ephemeral — after a reload everyone re-grabs freely. */
+const SAVE_KEY = 'save';
+let saveT = null, _idbp = null;
+function idb(){
+  if(_idbp) return _idbp;
+  _idbp = new Promise((res, rej) => {
+    try{
+      const rq = indexedDB.open('jigsaw-together', 1);
+      rq.onupgradeneeded = () => rq.result.createObjectStore('kv');
+      rq.onsuccess = () => res(rq.result);
+      rq.onerror = () => rej(rq.error || new Error('IndexedDB unavailable'));
+      rq.onblocked = () => rej(new Error('IndexedDB blocked'));
+    }catch(e){ rej(e); }
+  }).catch(() => { _idbp = null; return null; });
+  return _idbp;
+}
+function idbSet(k, v){
+  return idb().then(db => db && new Promise(res => {
+    try{
+      const tx = db.transaction('kv', 'readwrite');
+      tx.objectStore('kv').put(v, k);
+      tx.oncomplete = () => res(true);
+      tx.onerror = tx.onabort = () => res(false);
+    }catch(e){ res(false); }
+  }));
+}
+function idbGet(k){
+  return idb().then(db => db && new Promise(res => {
+    try{
+      const rq = db.transaction('kv').objectStore('kv').get(k);
+      rq.onsuccess = () => res(rq.result);
+      rq.onerror = () => res(undefined);
+    }catch(e){ res(undefined); }
+  }));
+}
+
+function snapshotSave(){
+  return {
+    v: 2, savedAt: Date.now(),
+    puzzle: S.puzzle,
+    name: S.me.name,
+    imgName: S.imgName,
+    imgBytes: S.imgBytes || null,          // Uint8Array — structured-cloned as-is
+    cam: { x: cam.x, y: cam.y, s: cam.s }, // pan & zoom come back too
+    startedAt: S.startedAt || Date.now(),
+    solved: S.solved,
+    pieces: [...S.pieces.values()].map(p => [p.id, Math.round(p.x), Math.round(p.y), p.g, p.z])
+  };
+}
+function saveSoon(){ if(!saveT) saveT = setTimeout(saveNow, 900); }
+function saveNow(){
+  if(saveT){ clearTimeout(saveT); saveT = null; }
+  if(!S.started || !S.puzzle) return;
+  const data = snapshotSave();
+  idbSet(SAVE_KEY, data).then(ok => {
+    if(ok){ try{ localStorage.removeItem('jt_save'); }catch(e){} } // legacy copy superseded
+    else saveLocalStorage(data);
+  });
+}
+function saveUrgent(){ // page is going away — write what must survive, synchronously where possible
+  if(!S.started || !S.puzzle) return;
+  const data = snapshotSave();
+  saveLocalStorage(data);                 // sync, no picture (keeps positions safe)
+  try{ idbSet(SAVE_KEY, data); }catch(e){} // best effort: full copy with the picture
+}
+function saveLocalStorage(data){
+  const d = Object.assign({}, data, { imgBytes: null });
+  if(data.imgBytes && data.imgBytes.length < 2200000) d.imgB64 = b64uEnc(data.imgBytes);
+  try{ localStorage.setItem('jt_save', JSON.stringify(d)); }
+  catch(e){
+    try{ delete d.imgB64; localStorage.setItem('jt_save', JSON.stringify(d)); }catch(e2){}
+  }
+}
+async function loadSave(){ // newest copy wins; a missing picture is filled in
+                           // from the other copy (unload-time localStorage copy
+                           // is fresher but carries no picture, and vice versa)
+  const ls = await Promise.resolve().then(() => {
+    try{ return JSON.parse(localStorage.getItem('jt_save')); }catch(e){ return null; }
+  });
+  const idbSave = await idbGet(SAVE_KEY);
+  const cands = [idbSave, ls].filter(d => d && d.puzzle);
+  for(const d of cands){
+    if(d.imgB64 && !d.imgBytes){ try{ d.imgBytes = b64uDec(d.imgB64); }catch(e){} }
+  }
+  if(!cands.length) return null;
+  cands.sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+  const best = cands[0];
+  if(!best.imgBytes){
+    const other = cands.find(d => d.imgBytes && d.imgBytes.length &&
+                                 d.puzzle.imgHash === best.puzzle.imgHash);
+    if(other) best.imgBytes = other.imgBytes;
+  }
+  return best;
+}
+async function continueSession(){
+  const d = await loadSave();
+  if(!d || !d.puzzle) return;
+  closeModal('#mStart');
+  if(d.name){ S.me.name = d.name; $('#nameIn').value = d.name; }
+  if(d.imgBytes){
+    try{ await applyImageBytes(d.imgBytes, d.imgName || 'picture'); }
+    catch(e){ toast('Saved picture could not be restored', 'err'); }
+  }
+  S.puzzle = d.puzzle;
+  buildPieces();
+  for(const row of (d.pieces || [])){
+    const p = S.pieces.get(row[0]);
+    if(p){ p.x = row[1]; p.y = row[2]; p.g = row[3]; p.z = row[4]; }
+  }
+  S.locks.clear(); // stale locks from the previous session mean nothing now
+  S.started = true; S.solved = !!d.solved; S.solvedShown = !!d.solved;
+  S.startedAt = d.startedAt || Date.now();
+  if(d.cam && isFinite(d.cam.x) && isFinite(d.cam.y) && d.cam.s > 0){
+    cam.x = d.cam.x; cam.y = d.cam.y; cam.s = clamp(d.cam.s, 0.12, 4);
+  }else fitCamera();
+  updateRosterUI(); saveSoon();
+  toast('Session restored', 'ok');
+}
+
+/* ---------------- session start ---------------- */
+async function ensureDefaultArt(){
+  if(S.imgBytes) return;
+  const art = await makeDefaultArt();
+  await applyImageBytes(art.bytes, 'Night Harbor (built-in)');
+}
+async function beginSession(short){
+  S.me.name = ($('#nameIn').value || '').trim().slice(0, 18) || S.me.name;
+  try{ localStorage.setItem('jt_name', S.me.name); }catch(e){}
+  closeModal('#mStart');
+  await ensureDefaultArt();
+  newGame({ short: short || 6 });
+  toast('Session started — press Invite to play together', 'ok', 3400);
+}
+
+/* waiting helper used by invite/join dialogs */
+function waitConnection(statusEl, onOk){
+  const t0 = Date.now();
+  const iv = setInterval(() => {
+    const up = NET.connectedIds();
+    if(up.length){
+      clearInterval(iv);
+      statusEl.textContent = 'Connected.';
+      statusEl.className = 'status ok';
+      onOk && setTimeout(onOk, 500);
+      return;
+    }
+    // both sides are empty-handed: the lowest id boots a default game
+    if(!S.started && up.length === 0 && Date.now() - t0 > 4000){
+      const relays = [...NET.peers.values()].filter(p => p.dc);
+      if(relays.length && relays.every(p => p.id && S.me.id < p.id)){
+        clearInterval(iv);
+        ensureDefaultArt().then(() => newGame({})).then(() => {
+          statusEl.textContent = 'Connected.';
+          onOk && setTimeout(onOk, 400);
+        });
+        return;
+      }
+    }
+    if(Date.now() - t0 > 120000){
+      clearInterval(iv);
+      statusEl.textContent = 'Still waiting — check the codes and try again.';
+      statusEl.className = 'status bad';
+    }
+  }, 350);
+}
+
+/* ---------------- invite dialog ---------------- */
+$('#bInvite').addEventListener('click', async () => {
+  openModal('#mInvite');
+  $('#invOffer').value = ''; $('#invAnswer').value = '';
+  $('#invStatus').textContent = 'Generating invite code…';
+  $('#bInvConnect').disabled = true;
+  try{
+    const code = await createInvite();
+    $('#invOffer').value = code;
+    $('#invStatus').textContent = 'Code ready — send it to the other player.';
+    $('#bInvConnect').disabled = false;
+  }catch(err){
+    $('#invStatus').textContent = err.message;
+  }
+});
+$('#bInvCopy').addEventListener('click', () => copyText($('#invOffer').value));
+$('#bInvLink').addEventListener('click', () => {
+  const base = location.href.split('#')[0];
+  copyText(base + '#j=' + $('#invOffer').value);
+});
+$('#bInvConnect').addEventListener('click', async () => {
+  try{
+    $('#invStatus').textContent = 'Connecting…';
+    await completeInvite($('#invAnswer').value);
+    waitConnection($('#invStatus'), () => closeModal('#mInvite'));
+  }catch(err){
+    $('#invStatus').textContent = err.message;
+  }
+});
+
+/* ---------------- join dialog ---------------- */
+let pendingJoinCode = '';
+function openJoin(prefill){
+  openModal('#mJoin');
+  if(prefill) $('#joinOffer').value = prefill;
+}
+$('#bJoin').addEventListener('click', () => openJoin());
+$('#bStartJoin').addEventListener('click', () => {
+  closeModal('#mStart');
+  openJoin(pendingJoinCode);
+  pendingJoinCode = '';
+});
+$('#bJoinGen').addEventListener('click', async () => {
+  const st = $('#joinStatus1');
+  try{
+    st.textContent = 'Generating reply…';
+    const reply = await acceptInviteCode($('#joinOffer').value);
+    $('#joinReply').value = reply;
+    st.textContent = 'Now send the reply code back — the board will load automatically.';
+    waitConnection(st, () => closeModal('#mJoin'));
+  }catch(err){
+    st.textContent = err.message;
+  }
+});
+$('#bJoinCopy').addEventListener('click', () => copyText($('#joinReply').value));
+
+/* ---------------- start dialog ---------------- */
+$('#bStartNew').addEventListener('click', () => beginSession(6));
+$('#bContinue').addEventListener('click', continueSession);
+
+/* ---------------- new game dialog ----------------
+   The user picks only the piece count on the picture's SHORTER side; the
+   live label shows the grid that follows from the picture's aspect ratio. */
+function updateNgCount(){
+  const g = gridFor(+$('#ngShort').value, S.img);
+  $('#ngCount').textContent = g.cols + ' × ' + g.rows + ' · ' + (g.cols * g.rows) + ' pieces';
+}
+(function fillShortSelect(){
+  const sel = $('#ngShort');
+  for(let i = 2; i <= 24; i++) sel.add(new Option(i, i));
+  sel.value = '6';
+  sel.onchange = updateNgCount;
+  updateNgCount();
+})();
+let pendingPic = null;
+function refreshThumb(){
+  updateNgCount();
+  const th = $('#ngThumb');
+  if(S.imgBytes){
+    if(th.dataset.url) URL.revokeObjectURL(th.dataset.url);
+    th.dataset.url = URL.createObjectURL(new Blob([S.imgBytes]));
+    th.src = th.dataset.url;
+    $('#ngFileName').textContent = S.imgName || '';
+  }
+}
+$('#bNgPick').addEventListener('click', () => { fileMode = 'newgame'; $('#file').click(); });
+$('#bNew').addEventListener('click', () => { refreshThumb(); openModal('#mNew'); });
+$('#bNgCreate').addEventListener('click', async () => {
+  const short = +$('#ngShort').value;
+  closeModal('#mNew');
+  if(!S.started) { await beginSession(short); return; }
+  S.me.name = ($('#nameIn').value || '').trim().slice(0, 18) || S.me.name;
+  newGame({ short });
+  toast('New game dealt', 'ok');
+});
+
+/* ---------------- picture loading (file, drop, paste) ---------------- */
+let fileMode = 'replace';
+$('#bPic').addEventListener('click', () => { fileMode = 'replace'; $('#file').click(); });
+$('#file').addEventListener('change', async e => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if(f) await handlePictureFile(f, fileMode);
+});
+async function handlePictureFile(f, mode){
+  let bytes;
+  try{ bytes = await readAsArrayBuffer(f); }catch(e){ toast('Cannot read that file', 'err'); return; }
+  if(!S.started){
+    try{
+      await applyImageBytes(bytes, f.name);
+      beginSession(6);
+    }catch(e){ toast(e.message, 'err'); }
+    return;
+  }
+  try{ await applyImageBytes(bytes, f.name); }catch(e){ toast(e.message, 'err'); return; }
+  if(mode === 'newgame'){ refreshThumb(); return; }
+  // swap the picture mid-session, keep the layout; everyone follows
+  if(S.puzzle){ S.puzzle.imgHash = S.imgHash; S.puzzle.imgName = S.imgName; }
+  NET.bcast({ t: 'sync', st: makeState() });
+  toast('Picture updated for everyone', 'ok');
+}
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('drop', e => {
+  e.preventDefault();
+  const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if(f && f.type.startsWith('image/')) handlePictureFile(f, 'replace');
+});
+window.addEventListener('paste', e => {
+  const items = (e.clipboardData && e.clipboardData.items) || [];
+  for(const it of items){
+    if(it.type && it.type.startsWith('image/')){
+      const f = it.getAsFile();
+      if(f) handlePictureFile(f, S.started ? 'replace' : 'newgame');
+      break;
+    }
+  }
+});
+
+/* ---------------- toolbar ---------------- */
+$('#bShuffle').addEventListener('click', shuffleAll);
+$('#bHelp').addEventListener('click', () => openModal('#mHelp'));
+$('#bSound').addEventListener('click', () => {
+  SFX.on = !SFX.on;
+  $('#bSound').textContent = 'Sound: ' + (SFX.on ? 'on' : 'off');
+});
+$('#zoomIn').addEventListener('click', () => zoomAt(vw / 2, vh / 2, 1.25));
+$('#zoomOut').addEventListener('click', () => zoomAt(vw / 2, vh / 2, 0.8));
+$('#bSolvedClose').addEventListener('click', () => { closeModal('#mSolved'); S.solvedShown = true; });
+$('#bSolvedNew').addEventListener('click', () => { closeModal('#mSolved'); S.solvedShown = true; refreshThumb(); openModal('#mNew'); });
+
+/* ---------------- boot ---------------- */
+function boot(){
+  resize();
+  $('#nameIn').value = localStorage.getItem('jt_name') || S.me.name;
+  loadSave().then(d => {            // offer the saved session, with a peek at what it holds
+    if(!d) return;
+    const b = $('#bContinue');
+    const n = (d.pieces || []).length;
+    const t = new Date(d.savedAt || Date.now());
+    const hh = String(t.getHours()).padStart(2, '0'), mm = String(t.getMinutes()).padStart(2, '0');
+    b.textContent = 'Continue last session · ' + (n ? n + ' pieces · ' : '') + 'saved ' + hh + ':' + mm;
+    b.hidden = false;
+  });
+  if(location.hash.startsWith('#j=')){
+    try{ pendingJoinCode = decodeURIComponent(location.hash.slice(3)); }catch(e){}
+    if(pendingJoinCode){
+      $('#bStartJoin').textContent = 'Join with the code from your link';
+      history.replaceState(null, '', location.pathname + location.search);
+    }
+  }
+  updateRosterUI();
+  startHeartbeat();
+  setInterval(ensureMesh, 3500);
+  setInterval(bcastPlayers, 30000);
+  window.addEventListener('beforeunload', () => { try{ leaveSession(); saveUrgent(); }catch(e){} });
+  document.addEventListener('visibilitychange', () => {
+    if(document.hidden){ try{ saveNow(); }catch(e){} } // tab hidden / phone locked — flush now
+  });
+  requestAnimationFrame(frame);
+}
+boot();
+
+/* ---------------- debug / test hooks ---------------- */
+window.__JZ = {
+  S, NET, cam, version: '1.0',
+  w2s: (x, y) => w2s(x, y),
+  s2w: (x, y) => s2w(x, y),
+  pieces: () => [...S.pieces.values()].map(p => ({ id: p.id, x: +p.x.toFixed(1), y: +p.y.toFixed(1), g: p.g, z: p.z })),
+  puzzle: () => S.puzzle,
+  gridFor,
+  connected: () => NET.connectedIds().map(id => ({ id, name: (NET.peers.get(id) || {}).name })),
+  started: () => S.started && !!S.puzzle,
+  hasImage: () => !!(S.imgBytes && S.imgHash === (S.puzzle && S.puzzle.imgHash)),
+  api: {
+    beginSession, newGame: o => newGame(o), shuffle: shuffleAll,
+    createInvite, acceptInviteCode, completeInvite,
+    state: () => makeState(),
+    grab: g => grabLocal(g),
+    stream: (g, x, y) => { setGroupAnchor(g, x, y); NET.bcast({ t: 'm', g, x, y }); },
+    dropHeld: g => { S.locks.delete(g); broadcastGroup(g); checkSolved(); saveSoon(); },
+    movePiece: (id, dx, dy) => {   // full grab -> stream -> drop through the net path
+      const p = S.pieces.get(id); if(!p) return false;
+      if(!grabLocal(p.g)) return false;
+      const a = S.pieces.get(p.g);
+      const tx = a.x + dx, ty = a.y + dy;
+      setGroupAnchor(p.g, tx, ty);
+      NET.bcast({ t: 'm', g: p.g, x: tx, y: ty });
+      S.locks.delete(p.g);
+      resolveSnap(p.g);
+      broadcastGroup(p.g);
+      checkSolved();
+      saveSoon();
+      return true;
+    },
+    tryGrab: id => {               // simulate pointer grab without moving
+      const p = S.pieces.get(id); if(!p) return false;
+      return grabLocal(p.g);
+    },
+    saveNow: () => saveNow(),
+    loadSave: () => loadSave(),
+    applyImageBytes
+  }
+};
+
+</script>
+</body>
+</html>
