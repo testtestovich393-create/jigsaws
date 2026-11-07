@@ -138,7 +138,6 @@ hr.s{border:none;border-top:1px solid var(--line);margin:14px 0}
   </div>
   <button class="b acc" id="bInvite" hidden title="Copy the table link to share">Invite</button>
   <button class="b" id="bNew">New game</button>
-  <button class="b" id="bPic">Picture</button>
   <button class="b" id="bShuffle">Shuffle</button>
   <button class="b" id="bSound">Sound: on</button>
   <button class="b" id="bHelp">?</button>
@@ -163,9 +162,14 @@ hr.s{border:none;border-top:1px solid var(--line);margin:14px 0}
     <button class="b acc" id="bStartNew">Play</button>
     <button class="b" id="bContinue" hidden>Continue last session</button>
   </div>
+  <div class="row" id="joinRow" style="margin-top:12px">
+    <input type="text" id="joinIn" placeholder="Table code or invite link" style="flex:1;min-width:0" autocomplete="off" spellcheck="false">
+    <button class="b" id="bJoinCode" title="Join a table by its code">Join</button>
+  </div>
   <p style="margin-top:14px">Press <b>Play</b> and share the invite link — everyone who opens it
-  plays on the same board, no installs and no server needed. The page can be hosted on any
-  static host (GitHub Pages, Netlify, …) or opened as a plain file to play solo.</p>
+  plays on the same board, no installs and no server needed. Or paste a table code above.
+  The page can be hosted on any static host (GitHub Pages, Netlify, …) or opened as a plain
+  file to play solo.</p>
 </div></div>
 
 <!-- new game -->
@@ -209,8 +213,9 @@ hr.s{border:none;border-top:1px solid var(--line);margin:14px 0}
     <tr><td>Open a table</td><td>Press <b>Play</b>: the page claims a room code and the address
       gains <b>#j=code</b>. The <b>Invite</b> button (top bar) copies that link.</td></tr>
     <tr><td>Join</td><td>Open an invite link, type a nickname — that is all. A running game pulls
-      you straight in; on an empty table the first player picks a picture and deals. No codes,
-      no installs, no server to run.</td></tr>
+      you straight in; on an empty table the first player picks a picture and deals. Can't pass
+      a link? Type the table code (the part after <b>#j=</b>) into the code box on the start
+      screen and press <b>Join</b>.</td></tr>
     <tr><td>The host</td><td>The player who opened the table is its referee: their tab grants
       piece locks and relays the moves. If they close the tab, the next player takes over
       hosting automatically (a few seconds) and the table keeps its link.</td></tr>
@@ -219,8 +224,8 @@ hr.s{border:none;border-top:1px solid var(--line);margin:14px 0}
     <tr><td>Locks</td><td>A grabbed group is locked by the host: only one player can hold a
       group, a late grab is refused and the piece shakes. Locks expire after 30&nbsp;s without
       motion and vanish on drop or disconnect.</td></tr>
-    <tr><td>Picture</td><td>The picture travels between players as hash-checked chunks — swapping
-      it mid-game updates everyone.</td></tr>
+    <tr><td>Picture</td><td>The picture is chosen when a new game is created and travels between
+      players as hash-checked chunks — late joiners fetch it automatically.</td></tr>
   </table>
   <h3>Put it online (GitHub Pages and friends)</h3>
   <p>The file is fully static — hosting it is a two-minute job:</p>
@@ -245,7 +250,8 @@ hr.s{border:none;border-top:1px solid var(--line);margin:14px 0}
     <tr><td>gb / dn</td><td>grab request / refused (another player holds the group)</td></tr>
     <tr><td>m</td><td>motion stream while dragging (~30 Hz)</td></tr>
     <tr><td>dp</td><td>drop with authoritative group positions</td></tr>
-    <tr><td>ng / sync</td><td>new game / picture swap (picture pushed to the host first)</td></tr>
+    <tr><td>ng</td><td>new game — the creator broadcasts the whole board; the picture rides along as
+      hash-checked chunks for anyone who misses it</td></tr>
     <tr><td>img</td><td>picture transfer over the DataChannel (hash-checked chunks)</td></tr>
     <tr><td>players / jn / lf</td><td>roster updates; someone joined / left the table</td></tr>
     <tr><td>#j=code</td><td>the table lives in the link itself; the broker only introduces the players</td></tr>
@@ -1399,6 +1405,7 @@ function destroyPeer(){
 }
 function openBrokerPeer(bid, reclaim){
   destroyPeer();
+  NET._claimBeat = Date.now();                 // claim-watchdog progress mark
   let p;
   try{ p = newPeer(bid); }
   catch(e){ claimFail(e); return; }
@@ -1436,7 +1443,7 @@ function openBrokerPeer(bid, reclaim){
     }else if(type === 'unavailable-id'){
       // claiming a FRESH code that someone just took — pick another
       NET.room = roomCode();
-      openBrokerPeer(ROOM_PREFIX + NET.room, false);
+      openBrokerPeer(ROOM_PREFIX + NET.room, false);   // re-arms the watchdog
     }else if(type === 'peer-unavailable'){
       /* join-side: handled in guestConnect */
     }else{
@@ -1455,16 +1462,28 @@ function claimFail(err){
     NET.mode = 'solo';
     NET.connected = false;
     toast('Could not open a table — playing solo (check your connection)', 'err', 4200);
+    if(typeof updateInviteUI === 'function') updateInviteUI();
   }
 }
-/* open (or re-open after a dead host) a table under a room code */
+/* open (or re-open after a dead host) a table under a room code.
+   A watchdog rejects after 20 s without broker progress — a dead public
+   cloud must be VISIBLE, not a silent infinite wait. */
 NET.openTable = function(room){
   return new Promise((resolve, reject) => {
     claimResolve = resolve; claimReject = reject;
     NET.mode = 'host';
     NET.room = room;
+    NET.claimTries = 0;
     hostLocks.clear();
     openBrokerPeer(ROOM_PREFIX + room, true);
+    if(typeof updateInviteUI === 'function') updateInviteUI();
+    const iv = setInterval(() => {
+      if(claimReject === null || NET.claimed){ clearInterval(iv); return; }
+      if(Date.now() - (NET._claimBeat || 0) > 20000){
+        clearInterval(iv);
+        claimFail({ type: 'network', message: 'signalling timeout' });
+      }
+    }, 500);
   });
 };
 
@@ -1610,6 +1629,7 @@ NET.joinRoom = function(room){
   NET.wantJoin = true;
   NET.joinTries = 0;
   NET.claimPending = false;
+  if(typeof updateInviteUI === 'function') updateInviteUI();
   guestConnect();
 };
 function guestConnect(){
@@ -1981,17 +2001,24 @@ function leaveSession(){
   updateRosterUI();
 }
 
-/* ---------------- picture application (local) ---------------- */
-async function applyImageBytes(bytes, name){
+/* ---------------- picture application (local) ----------------
+   A picture that matches the LIVE board's hash is the board's picture:
+   repaint every piece and refit the camera. Anything else is just the
+   PENDING picture for a future new game — the running board must keep
+   showing its own image untouched (repainting it would stretch the new
+   picture over the old grid: the squished-image bug). */
+async function applyImageBytes(bytes, name, persist){
+  const h = hashBytes(bytes);
+  const isBoard = !!(S.puzzle && S.puzzle.imgHash && S.puzzle.imgHash === h);
   const loaded = await loadImageFromBytes(bytes, name);
   S.img = loaded;
   S.imgBytes = bytes; S.imgName = name || 'picture';
-  S.imgHash = hashBytes(bytes);
-  if(S.puzzle && S.puzzle.imgHash && S.puzzle.imgHash !== S.imgHash){
-    S.puzzle.imgHash = S.imgHash; S.puzzle.imgName = S.imgName;
+  S.imgHash = h;
+  if(isBoard){
+    repaintPieces();
+    fitCamera();
   }
-  repaintPieces();
-  onImageReady();
+  if(persist !== false) saveSoon();   // a pending next-game picture is not saved
   return true;
 }
 function onImageReady(){
@@ -2015,7 +2042,13 @@ document.addEventListener('pointerdown', () => SFX.ensure(), { once: true });
 function updateRosterUI(){
   const ids = NET.connectedIds();
   const n = ids.length + 1;
-  $('#playersTxt').textContent = n <= 1 ? 'solo' : n + ' players';
+  const txt = $('#playersTxt');
+  if(NET.mode === 'host' && !NET.connected) txt.textContent = 'opening table…';
+  else if(NET.mode === 'guest' && !NET.connected && NET.wantJoin && NET.room)
+    txt.textContent = 'joining ' + NET.room.toUpperCase() + '…';
+  else if(ids.length > 0) txt.textContent = n + ' players';
+  else if(NET.connected && NET.room) txt.textContent = 'table ' + NET.room.toUpperCase() + ' — waiting';
+  else txt.textContent = 'solo';
   $('#netDot').classList.toggle('on', ids.length > 0);
   const dots = $('#playerDots');
   dots.innerHTML = '';
@@ -2024,16 +2057,26 @@ function updateRosterUI(){
     i.style.background = colorOf(id);
     dots.appendChild(i);
   }
+  $('#playersChip').title = NET.connected
+    ? 'Connected players — click to rename'
+    : 'Not connected to a table';
   updateInviteUI();
 }
 
-/* the invite link is the whole multiplayer UX: copy it, send it, done */
+/* the invite link is the whole multiplayer UX: copy it, send it, done.
+   It appears as soon as a table code exists (grey while the broker claim
+   or the join is still in flight) so the control is never a surprise. */
 function updateInviteUI(){
-  const on = !!(NET.room && (location.protocol === 'http:' || location.protocol === 'https:'));
-  $('#bInvite').hidden = !on;
+  const web = location.protocol === 'http:' || location.protocol === 'https:';
+  const on = !!(NET.room && web);
+  const b = $('#bInvite');
+  b.hidden = !on;
+  b.disabled = on && !NET.connected;
+  b.title = !on ? '' : (NET.connected ? 'Copy the table link to share'
+                                      : 'Opening the table…');
 }
 $('#bInvite').addEventListener('click', () => {
-  if(NET.room) copyText(NET.shareLink());
+  if(NET.room && NET.connected) copyText(NET.shareLink());
 });
 
 /* click the players chip to rename yourself (auto-joined players never
@@ -2090,12 +2133,17 @@ function idbGet(k){
 }
 
 function snapshotSave(){
+  // a picture whose hash differs from the live board (a just-pushed or
+  // mid-swap picture) must NOT be persisted with this board — restoring
+  // that pair would show a stretched picture; the net re-fetches instead
+  const mismatch = !!(S.puzzle && S.puzzle.imgHash && S.imgHash &&
+                      S.puzzle.imgHash !== S.imgHash);
   return {
     v: 2, savedAt: Date.now(),
     puzzle: S.puzzle,
     name: S.me.name,
     imgName: S.imgName,
-    imgBytes: S.imgBytes || null,          // Uint8Array — structured-cloned as-is
+    imgBytes: mismatch ? null : (S.imgBytes || null),   // Uint8Array — structured-cloned as-is
     cam: { x: cam.x, y: cam.y, s: cam.s }, // pan & zoom come back too
     startedAt: S.startedAt || Date.now(),
     solved: S.solved,
@@ -2178,11 +2226,24 @@ async function ensureDefaultArt(){
   const art = await makeDefaultArt();
   await applyImageBytes(art.bytes, 'Night Harbor (built-in)');
 }
+/* on a web origin EVERY started session lives at a table, whatever path
+   started it (Play, a dropped or pasted picture, the new-game dialog) —
+   otherwise the invite button and the #j= link would silently never
+   appear. Best-effort: if the broker is unreachable the game still deals,
+   loudly solo. */
+async function ensureTable(){
+  if(location.protocol !== 'http:' && location.protocol !== 'https:') return;
+  if(NET.connected || NET.claimed) return;
+  if(NET.mode === 'guest' && NET.wantJoin) return;    // a join is already in flight
+  const room = NET.claimPending ? NET.room : (NET.room || roomCode());
+  await NET.openTable(room);
+}
 async function beginSession(short){
   S.me.name = ($('#nameIn').value || '').trim().slice(0, 18) || S.me.name;
   try{ localStorage.setItem('jt_name', S.me.name); }catch(e){}
   closeModal('#mStart');
   closeModal('#mNew');
+  try{ await ensureTable(); }catch(e){ /* claimFail already told the user */ }
   await ensureDefaultArt();
   await ensureHostHasPicture();             // a guest creating on an empty table pushes the picture first
   newGame({ short: short || 6 });
@@ -2254,11 +2315,35 @@ $('#bStartNew').addEventListener('click', async () => {
 });
 $('#bContinue').addEventListener('click', continueSession);
 
+/* ---------------- join by code (the manual fallback) ----------------
+   Links are the main way in; the code box is for when a link is awkward
+   (voice chat, a printed sheet, a screenshot). It accepts the bare code
+   or a whole pasted invite link. */
+function codeFromInput(v){
+  v = (v || '').trim();
+  const mh = v.match(/#j=([a-z0-9]{3,16})/i);
+  if(mh) return mh[1].toLowerCase();
+  return /^[a-z0-9]{3,16}$/.test(v) ? v.toLowerCase() : null;
+}
+function joinByCode(){
+  const code = codeFromInput($('#joinIn').value);
+  if(!code){ toast('Enter a table code — or paste an invite link', 'err'); return; }
+  if(location.protocol !== 'http:' && location.protocol !== 'https:'){
+    toast('Open this page from a web address (e.g. GitHub Pages) to join a table', 'err', 4200);
+    return;
+  }
+  NET.joinRoom(code);
+  showStartDialog('joining');
+}
+$('#bJoinCode').addEventListener('click', joinByCode);
+$('#joinIn').addEventListener('keydown', e => { if(e.key === 'Enter') joinByCode(); });
+
 /* ---------------- new game dialog ----------------
    The user picks only the piece count on the picture's SHORTER side; the
    live label shows the grid that follows from the picture's aspect ratio. */
+let pendingPic = null;   // {bytes, name, img} — the picture for the NEXT game
 function updateNgCount(){
-  const g = gridFor(+$('#ngShort').value, S.img);
+  const g = gridFor(+$('#ngShort').value, (pendingPic && pendingPic.img) || S.img);
   $('#ngCount').textContent = g.cols + ' × ' + g.rows + ' · ' + (g.cols * g.rows) + ' pieces';
 }
 (function fillShortSelect(){
@@ -2268,38 +2353,48 @@ function updateNgCount(){
   sel.onchange = updateNgCount;
   updateNgCount();
 })();
-let pendingPic = null;
 function refreshThumb(){
   updateNgCount();
   const th = $('#ngThumb');
-  if(S.imgBytes){
+  const bytes = (pendingPic && pendingPic.bytes) || S.imgBytes;
+  const name = (pendingPic && pendingPic.name) || S.imgName;
+  if(bytes){
     if(th.dataset.url) URL.revokeObjectURL(th.dataset.url);
-    th.dataset.url = URL.createObjectURL(new Blob([S.imgBytes]));
+    th.dataset.url = URL.createObjectURL(new Blob([bytes]));
     th.src = th.dataset.url;
-    $('#ngFileName').textContent = S.imgName || '';
+    $('#ngFileName').textContent = name || '';
   }
 }
-$('#bNgPick').addEventListener('click', () => { fileMode = 'newgame'; $('#file').click(); });
+$('#bNgPick').addEventListener('click', () => { $('#file').click(); });
 $('#bNew').addEventListener('click', () => { refreshThumb(); openModal('#mNew'); });
 $('#bNgCreate').addEventListener('click', async () => {
   const short = +$('#ngShort').value;
   closeModal('#mNew');
   if(!S.started){ await beginSession(short); return; }
   S.me.name = ($('#nameIn').value || '').trim().slice(0, 18) || S.me.name;
+  if(pendingPic){                      // commit the picked picture only NOW —
+    S.img = pendingPic.img;            // the running board was never touched
+    S.imgBytes = pendingPic.bytes;
+    S.imgName = pendingPic.name;
+    S.imgHash = hashBytes(pendingPic.bytes);
+    pendingPic = null;
+  }
   await ensureHostHasPicture();           // the host must hold the new picture first
   newGame({ short });
   toast('New game dealt', 'ok');
 });
 
-/* ---------------- picture loading (file, drop, paste) ---------------- */
-let fileMode = 'replace';
-$('#bPic').addEventListener('click', () => { fileMode = 'replace'; $('#file').click(); });
+/* ---------------- picture loading (file, drop, paste) ----------------
+   A picture picked BEFORE a session becomes the first board. During a
+   session it becomes the PENDING picture for the NEXT game (shown in the
+   new-game dialog) — the running board is never stretched over a new
+   picture's aspect ratio, and there is no mid-game picture swap. */
 $('#file').addEventListener('change', async e => {
   const f = e.target.files[0];
   e.target.value = '';
-  if(f) await handlePictureFile(f, fileMode);
+  if(f) await handlePictureFile(f);
 });
-async function handlePictureFile(f, mode){
+async function handlePictureFile(f){
   let bytes;
   try{ bytes = await readAsArrayBuffer(f); }catch(e){ toast('Cannot read that file', 'err'); return; }
   if(!S.started){
@@ -2309,27 +2404,26 @@ async function handlePictureFile(f, mode){
     }catch(e){ toast(e.message, 'err'); }
     return;
   }
-  try{ await applyImageBytes(bytes, f.name); }catch(e){ toast(e.message, 'err'); return; }
-  if(mode === 'newgame'){ refreshThumb(); return; }
-  // swap the picture mid-session, keep the layout; everyone follows
-  if(S.puzzle){ S.puzzle.imgHash = S.imgHash; S.puzzle.imgName = S.imgName; }
-  const pushed = await ensureHostHasPicture();   // a guest pushes the picture to the host first
-  if(!pushed) return;                            // do not broadcast a board the host cannot serve
-  NET.bcast({ t: 'sync', st: makeState() });
-  toast(NET.mode === 'solo' ? 'Picture updated' : 'Picture updated for everyone', 'ok');
+  try{
+    const img = await loadImageFromBytes(bytes, f.name);   // validate before showing
+    pendingPic = { bytes, name: f.name, img };
+  }catch(e){ toast(e.message, 'err'); return; }
+  refreshThumb();
+  openModal('#mNew');
+  toast('Picture ready — press Create & shuffle to start a new puzzle with it', 'ok', 4200);
 }
 window.addEventListener('dragover', e => e.preventDefault());
 window.addEventListener('drop', e => {
   e.preventDefault();
   const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-  if(f && f.type.startsWith('image/')) handlePictureFile(f, 'replace');
+  if(f && f.type.startsWith('image/')) handlePictureFile(f);
 });
 window.addEventListener('paste', e => {
   const items = (e.clipboardData && e.clipboardData.items) || [];
   for(const it of items){
     if(it.type && it.type.startsWith('image/')){
       const f = it.getAsFile();
-      if(f) handlePictureFile(f, S.started ? 'replace' : 'newgame');
+      if(f) handlePictureFile(f);
       break;
     }
   }
@@ -2384,7 +2478,9 @@ boot();
 
 /* ---------------- debug / test hooks ---------------- */
 window.__JZ = {
-  S, NET, cam, version: '3.0',
+  S, NET, cam, version: '3.1',
+  net: () => ({ mode: NET.mode, room: NET.room, connected: NET.connected,
+                claimed: NET.claimed, wantJoin: NET.wantJoin }),
   w2s: (x, y) => w2s(x, y),
   s2w: (x, y) => s2w(x, y),
   pieces: () => [...S.pieces.values()].map(p => ({ id: p.id, x: +p.x.toFixed(1), y: +p.y.toFixed(1), g: p.g, z: p.z })),
