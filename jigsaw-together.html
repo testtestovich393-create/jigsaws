@@ -14,9 +14,9 @@
 
   SERVERLESS MULTIPLAYER PROTOCOL (v1) — summary (full spec in NET section):
   * Transport : WebRTC DataChannels (ordered+reliable), full mesh, plain JSON.
-  * Signaling : manual invite codes (compressed SDP+ICE) with ANY existing
-                member; afterwards members relay SDP between each other, so
-                the mesh self-completes with no server at all.
+  * Signaling : manual invite/reply LINKS (compressed SDP+ICE, base64url) exchanged
+                through any chat; the reply link is clicked by the inviter and
+                delivered to their tab automatically (BroadcastChannel bridge).
   * Session   : no host, state fully replicated; lives while >=1 peer stays.
                 Anyone may join late (snapshot) or leave at any time.
   * Locking   : per-piece-group optimistic lock, deterministic winner
@@ -167,45 +167,72 @@ hr.s{border:none;border-top:1px solid var(--line);margin:14px 0}
   players' devices and are shared directly between them.</p>
 </div></div>
 
-<!-- invite (shown on the side of an existing player) -->
+<!-- invite (committed view: send the link, then wait — the reply usually comes
+     back as one more link to click; the paste field stays hidden until needed) -->
 <div class="modal" id="mInvite"><div class="panel">
   <button class="x" data-close>&times;</button>
   <h2>Invite a player</h2>
-  <p>Codes are exchanged through any channel you like (chat, e-mail, messenger, paper).</p>
-  <div class="step"><div class="stepn">1</div><div style="flex:1">
-    <p style="margin:0 0 6px">Send this <b>invite code</b> to the player who wants to join:</p>
-    <textarea class="code" id="invOffer" readonly placeholder="Generating invite code&hellip;"></textarea>
-    <div class="row" style="margin-top:6px"><button class="b" id="bInvCopy">Copy code</button>
-    <button class="b" id="bInvLink">Copy as link</button></div>
-  </div></div>
-  <div class="step"><div class="stepn">2</div><div style="flex:1">
-    <p style="margin:0 0 6px">Paste the <b>reply code</b> they send back, then connect:</p>
-    <textarea class="code" id="invAnswer" placeholder="Paste reply code here"></textarea>
+  <p style="margin:0 0 6px">Send this <b>invite link</b> to the other player — any chat will do
+  (it is already copied to your clipboard):</p>
+  <textarea class="code" id="invOffer" readonly placeholder="Generating invite link&hellip;"></textarea>
+  <div class="row" style="margin-top:6px">
+    <button class="b acc" id="bInvCopy">Copy link</button>
+    <span class="status" id="invStatus"></span>
+  </div>
+  <div class="hintbox" style="margin-top:10px">Keep this tab open. When your friend opens the link and joins,
+  the board appears here by itself — their reply comes back as one more link for you to click.</div>
+  <p style="margin:12px 0 0"><a href="#" id="invManualToggle" style="color:var(--tx2);font-size:12.5px">Received a reply code instead? Paste it here&hellip;</a></p>
+  <div id="invPhase2" hidden style="margin-top:8px">
+    <textarea class="code" id="invAnswer" placeholder="Paste the reply link or code here"></textarea>
     <div class="row" style="margin-top:6px">
-      <button class="b acc" id="bInvConnect">Connect</button><span class="status" id="invStatus"></span>
+      <button class="b acc" id="bInvConnect">Connect</button>
+      <span class="status" id="invStatus2"></span>
     </div>
-  </div></div>
-  <div class="hintbox">The newcomer will receive the current board and picture automatically.
-  After that first handshake all players link to each other directly (mesh), with no relay.</div>
+  </div>
 </div></div>
 
-<!-- join (shown on the newcomer side) -->
+<!-- join (committed view: link mode = one button; manual mode = one paste +
+     one button; both end in the same send-the-reply-link-back screen) -->
 <div class="modal" id="mJoin"><div class="panel">
   <button class="x" data-close>&times;</button>
-  <h2>Join a session</h2>
-  <div class="step"><div class="stepn">1</div><div style="flex:1">
-    <p style="margin:0 0 6px">Paste the <b>invite code</b> you received:</p>
-    <textarea class="code" id="joinOffer" placeholder="JT1.&hellip;"></textarea>
-    <div class="row" style="margin-top:6px"><button class="b acc" id="bJoinGen">Generate reply</button>
-    <span class="status" id="joinStatus1"></span></div>
-  </div></div>
-  <div class="step"><div class="stepn">2</div><div style="flex:1">
-    <p style="margin:0 0 6px">Send this <b>reply code</b> back to the sender:</p>
-    <textarea class="code" id="joinReply" readonly placeholder="Your reply will appear here"></textarea>
-    <div class="row" style="margin-top:6px"><button class="b" id="bJoinCopy">Copy reply</button></div>
-  </div></div>
-  <p>As soon as they confirm, you will be connected directly and the current board
-  will be synced to you automatically.</p>
+  <h2 id="joinTitle">Join a session</h2>
+  <div id="joinLinkMode" hidden>
+    <p id="joinInviter" style="margin:4px 0 10px">A player invited you to a puzzle session.</p>
+    <label class="f" style="margin-bottom:10px">Your nickname <span style="font-weight:400;text-transform:none">(optional)</span>
+      <input type="text" id="joinName" maxlength="18" placeholder="e.g. NightOwl">
+    </label>
+    <button class="b acc" id="bJoinAccept" style="width:100%;padding:11px">Join the session</button>
+    <span class="status" id="joinStatus0"></span>
+  </div>
+  <div id="joinPhase1" hidden>
+    <p style="margin:4px 0 6px">Paste the <b>invite link</b> you received:</p>
+    <textarea class="code" id="joinOffer" placeholder="Paste invite link or code"></textarea>
+    <div class="row" style="margin-top:6px">
+      <button class="b acc" id="bJoinGo">Join</button>
+      <span class="status" id="joinStatus1"></span>
+    </div>
+  </div>
+  <div id="joinPhase2" hidden>
+    <p style="margin:4px 0 6px">Almost there — send this <b>reply link</b> back to the sender
+    (it is already copied to your clipboard):</p>
+    <textarea class="code" id="joinReply" readonly placeholder="Your reply link will appear here"></textarea>
+    <div class="row" style="margin-top:6px">
+      <button class="b acc" id="bJoinCopy">Copy reply link</button>
+      <span class="status" id="joinStatus"></span>
+    </div>
+    <div class="hintbox" style="margin-top:10px">As soon as they open it, the board loads by itself.</div>
+  </div>
+</div></div>
+
+<!-- a reply link opened as its own tab: hand it to the tab holding the invite -->
+<div class="modal" id="mRelay"><div class="panel">
+  <button class="x" data-close>&times;</button>
+  <h2 id="relayTitle">Reply link</h2>
+  <p id="relayText"></p>
+  <div id="relayManual" hidden>
+    <textarea class="code" id="relayCode" readonly></textarea>
+    <div class="row" style="margin-top:6px"><button class="b acc" id="bRelayCopy">Copy reply link</button></div>
+  </div>
 </div></div>
 
 <!-- new game -->
@@ -245,7 +272,7 @@ hr.s{border:none;border-top:1px solid var(--line);margin:14px 0}
   (pieces, picture and view are all kept on this device).</p>
   <h3>Multiplayer without a server</h3>
   <table class="kv">
-    <tr><td>Invite</td><td>Any player presses <b>Invite</b> and sends the code to a friend; the friend sends a reply code back. That single exchange is the whole signup.</td></tr>
+    <tr><td>Invite</td><td>Press <b>Invite</b> once and send the link to a friend; they press <b>Join</b> once and send one reply link back. Clicking that reply link finishes the handshake by itself. Codes are just compressed WebRTC offers — nothing but the link ever leaves the players.</td></tr>
     <tr><td>Mesh</td><td>Right after joining, players introduce each other to everyone else and the session becomes a full peer-to-peer mesh of WebRTC channels. There is no host and no relay.</td></tr>
     <tr><td>Session life</td><td>The session exists as long as at least one player keeps the page open. Everyone can leave and come back with a fresh invite at any time; late joiners receive the full board state.</td></tr>
     <tr><td>Live moves</td><td>While you drag, piece positions stream to everyone ~30 times per second and are interpolated, so pieces glide on remote screens.</td></tr>
@@ -360,6 +387,8 @@ async function encodeCode(obj){
 }
 async function decodeCode(str){
   str = (str || '').trim().replace(/\s+/g, '');
+  const lm = str.match(/#(?:j|r)=([A-Za-z0-9\-_.]+)/);   // a whole invite/reply LINK works too
+  if(lm) str = lm[1];
   const dot = str.indexOf('.');
   if(dot < 1) throw new Error('Not a Jigsaw Together code');
   const tag = str.slice(0, dot), body = b64uDec(str.slice(dot + 1));
@@ -374,6 +403,12 @@ async function decodeCode(str){
   const obj = JSON.parse(json);
   if(!obj || !obj.sdp || (obj.t !== 'o' && obj.t !== 'a')) throw new Error('Malformed code payload');
   return obj;
+}
+
+/* self-contained session links: <app url>#j=<invite code> and #r=<reply code>.
+   Codes are base64url, so they are link-safe without escaping. */
+function makeLink(kind, code){
+  return location.href.split('#')[0] + '#' + kind + '=' + code;
 }
 
 /* ---- toasts ---- */
@@ -1404,6 +1439,7 @@ function registerLive(P){
   NET.peers.set(P.id, P);
   NET.pendingIntro.delete(P.id);
   if(NET.inviteP === P) NET.inviteP = null; // manual handshake completed
+  try{ window.dispatchEvent(new Event('jt-peer-connected')); }catch(e){}
   updateRosterUI();
   setTimeout(ensureMesh, 500);
   return true;
@@ -1432,7 +1468,10 @@ function wireChannel(P, dc){
 
 /* ---------------- manual invite codes ---------------- */
 async function createInvite(){
-  if(NET.inviteP) throw new Error('An invite is already being generated');
+  if(NET.inviteP){                    // a previous invite was never answered — replace it
+    try{ NET.inviteP.pc && NET.inviteP.pc.close(); }catch(e){}
+    NET.inviteP = null;
+  }
   const pc = newPc();
   const dc = pc.createDataChannel('jz');
   const P = { id: null, name: '?', pc, dc, lastHb: Date.now(), tx: null, rx: null };
@@ -1465,6 +1504,8 @@ async function completeInvite(code){
   if(d.t !== 'a') throw new Error('That is a reply code? expected reply — got invite');
   const P = NET.inviteP;
   if(!P || !P.pc) throw new Error('No pending invite — generate one first');
+  if(P.answered) return;                    // reply already applied (e.g. delivered from another tab)
+  P.answered = true;
   await P.pc.setRemoteDescription(d.sdp);
 }
 
@@ -1967,8 +2008,10 @@ async function beginSession(short){
 /* waiting helper used by invite/join dialogs */
 function waitConnection(statusEl, onOk){
   const t0 = Date.now();
+  const before = new Set(NET.connectedIds());  // peers already up — a NEW one is what we wait for
+                                               // (a just-disconnected peer can linger "open" for a while)
   const iv = setInterval(() => {
-    const up = NET.connectedIds();
+    const up = NET.connectedIds().filter(id => !before.has(id));
     if(up.length){
       clearInterval(iv);
       statusEl.textContent = 'Connected.';
@@ -1977,7 +2020,7 @@ function waitConnection(statusEl, onOk){
       return;
     }
     // both sides are empty-handed: the lowest id boots a default game
-    if(!S.started && up.length === 0 && Date.now() - t0 > 4000){
+    if(!S.started && NET.connectedIds().length === 0 && Date.now() - t0 > 4000){
       const relays = [...NET.peers.values()].filter(p => p.dc);
       if(relays.length && relays.every(p => p.id && S.me.id < p.id)){
         clearInterval(iv);
@@ -1996,61 +2039,130 @@ function waitConnection(statusEl, onOk){
   }, 350);
 }
 
-/* ---------------- invite dialog ---------------- */
+/* ---------------- invite — ONE press ----------------
+   Pressing Invite generates the link and copies it; that is the whole job.
+   The reply normally comes back as another link, which the inviter simply
+   CLICKS: that tab hands the reply here over a BroadcastChannel and the
+   connection completes itself. The paste field stays hidden until needed. */
 $('#bInvite').addEventListener('click', async () => {
   openModal('#mInvite');
-  $('#invOffer').value = ''; $('#invAnswer').value = '';
-  $('#invStatus').textContent = 'Generating invite code…';
-  $('#bInvConnect').disabled = true;
+  $('#invPhase2').hidden = true;
+  $('#invManualToggle').hidden = false;
+  $('#invAnswer').value = ''; $('#invStatus2').textContent = '';
+  $('#invOffer').value = '';
+  $('#invStatus').textContent = 'Generating invite link…';
   try{
     const code = await createInvite();
-    $('#invOffer').value = code;
-    $('#invStatus').textContent = 'Code ready — send it to the other player.';
-    $('#bInvConnect').disabled = false;
-  }catch(err){
-    $('#invStatus').textContent = err.message;
-  }
-});
-$('#bInvCopy').addEventListener('click', () => copyText($('#invOffer').value));
-$('#bInvLink').addEventListener('click', () => {
-  const base = location.href.split('#')[0];
-  copyText(base + '#j=' + $('#invOffer').value);
-});
-$('#bInvConnect').addEventListener('click', async () => {
-  try{
-    $('#invStatus').textContent = 'Connecting…';
-    await completeInvite($('#invAnswer').value);
+    const link = makeLink('j', code);
+    $('#invOffer').value = link;
+    let copied = false;
+    try{ await navigator.clipboard.writeText(link); copied = true; }catch(e){}
+    $('#invStatus').textContent = copied ? 'Link copied — send it to the other player.' :
+      'Copy the link and send it to the other player.';
     waitConnection($('#invStatus'), () => closeModal('#mInvite'));
   }catch(err){
     $('#invStatus').textContent = err.message;
   }
 });
-
-/* ---------------- join dialog ---------------- */
-let pendingJoinCode = '';
-function openJoin(prefill){
-  openModal('#mJoin');
-  if(prefill) $('#joinOffer').value = prefill;
-}
-$('#bJoin').addEventListener('click', () => openJoin());
-$('#bStartJoin').addEventListener('click', () => {
-  closeModal('#mStart');
-  openJoin(pendingJoinCode);
-  pendingJoinCode = '';
+$('#bInvCopy').addEventListener('click', () => copyText($('#invOffer').value));
+$('#invManualToggle').addEventListener('click', e => {
+  e.preventDefault();
+  $('#invPhase2').hidden = false;
+  $('#invManualToggle').hidden = true;
+  $('#invAnswer').focus();
 });
-$('#bJoinGen').addEventListener('click', async () => {
-  const st = $('#joinStatus1');
+$('#bInvConnect').addEventListener('click', async () => {   // manual fallback path
   try{
-    st.textContent = 'Generating reply…';
-    const reply = await acceptInviteCode($('#joinOffer').value);
-    $('#joinReply').value = reply;
-    st.textContent = 'Now send the reply code back — the board will load automatically.';
-    waitConnection(st, () => closeModal('#mJoin'));
+    $('#invStatus2').textContent = 'Connecting…';
+    await completeInvite($('#invAnswer').value);
   }catch(err){
-    st.textContent = err.message;
+    $('#invStatus2').textContent = err.message;
   }
 });
+window.addEventListener('jt-peer-connected', () => {        // any connect path closes the dialogs
+  closeModal('#mInvite'); closeModal('#mJoin'); closeModal('#mRelay');
+});
+
+/* ---------------- join — ONE press ----------------
+   Link mode (opened via an invite link): the start dialog is skipped and a
+   single "Join" button answers the offer. Manual mode: one paste + button.
+   Both end in the same "send this reply link back" screen, reply already
+   copied to the clipboard. */
+let pendingJoinCode = '';   // invite code carried by a #j= link, if any
+function openJoin(){
+  openModal('#mJoin');
+  $('#joinLinkMode').hidden = true;
+  $('#joinPhase1').hidden = false;
+  $('#joinPhase2').hidden = true;
+  $('#joinOffer').value = ''; $('#joinStatus1').textContent = '';
+  $('#joinReply').value = ''; $('#joinStatus').textContent = '';
+}
+$('#bJoin').addEventListener('click', () => openJoin());
+$('#bStartJoin').addEventListener('click', () => { closeModal('#mStart'); openJoin(); pendingJoinCode = ''; });
+async function joinWithCode(code, statusEl){
+  try{
+    const reply = await acceptInviteCode(code);
+    $('#joinLinkMode').hidden = true;
+    $('#joinPhase1').hidden = true;
+    $('#joinPhase2').hidden = false;
+    const link = makeLink('r', reply);
+    $('#joinReply').value = link;
+    let copied = false;
+    try{ await navigator.clipboard.writeText(link); copied = true; }catch(e){}
+    $('#joinStatus').textContent = copied ? 'Reply link copied — send it back.' :
+      'Copy the reply link and send it back.';
+    waitConnection($('#joinStatus'), () => closeModal('#mJoin'));
+  }catch(err){
+    toast(err.message, 'err');
+    if(statusEl) statusEl.textContent = err.message;
+    $('#joinPhase1').hidden = false;          // offer a hand-made retry
+    $('#joinOffer').value = code || '';
+  }
+}
+$('#bJoinGo').addEventListener('click', () => joinWithCode($('#joinOffer').value, $('#joinStatus1')));
+$('#bJoinAccept').addEventListener('click', () => {
+  const nm = ($('#joinName').value || '').trim().slice(0, 18);
+  if(nm){ S.me.name = nm; try{ localStorage.setItem('jt_name', nm); }catch(e){} }
+  joinWithCode(pendingJoinCode, $('#joinStatus0'));
+});
 $('#bJoinCopy').addEventListener('click', () => copyText($('#joinReply').value));
+
+/* ---------------- reply-link relay ----------------
+   The inviter CLICKS the reply link; this fresh tab has no WebRTC state,
+   so it passes the reply to the tab that created the invite (same browser)
+   over a BroadcastChannel and reports the outcome. If no tab answers, the
+   raw code is offered for the classic paste path. */
+function deliverReplyToInviterTab(code){
+  openModal('#mRelay');
+  $('#relayManual').hidden = true;
+  $('#relayCode').value = code;
+  $('#relayTitle').textContent = 'Reply link';
+  $('#relayText').textContent = 'Delivering the reply to your other tab…';
+  let done = false, ch = null;
+  try{ ch = new BroadcastChannel('jigsaw-together-signal'); }catch(e){}
+  const finish = ok => {
+    if(done) return; done = true;
+    if(ok){
+      $('#relayTitle').textContent = 'Reply delivered';
+      $('#relayText').textContent = 'Your other tab took it from here — the connection completes there. This tab can be closed.';
+    }else{
+      $('#relayTitle').textContent = 'No waiting session found';
+      $('#relayText').textContent = 'The tab where “Invite” was pressed seems closed, or the reply was opened in another browser. Open the tab that created the invite and paste this reply link into it — or ask for a fresh invite.';
+      $('#relayManual').hidden = false;
+      try{ navigator.clipboard.writeText(code).catch(() => {}); }catch(e){}
+    }
+    if(ch){ try{ ch.close(); }catch(e){} }
+  };
+  if(!ch){ finish(false); return; }
+  ch.onmessage = e => { if(e.data && e.data.type === 'jt-reply-ack') finish(true); };
+  let n = 0;
+  const iv = setInterval(() => {
+    if(done){ clearInterval(iv); return; }
+    if(++n > 10){ clearInterval(iv); finish(false); return; }
+    try{ ch.postMessage({ type: 'jt-reply', code }); }catch(e){ clearInterval(iv); finish(false); }
+  }, 300);
+}
+$('#bRelayCopy').addEventListener('click', () => copyText($('#relayCode').value));
 
 /* ---------------- start dialog ---------------- */
 $('#bStartNew').addEventListener('click', () => beginSession(6));
@@ -2159,11 +2271,41 @@ function boot(){
     b.textContent = 'Continue last session · ' + (n ? n + ' pieces · ' : '') + 'saved ' + hh + ':' + mm;
     b.hidden = false;
   });
+  // a friend's tab-to-tab reply bridge: any tab of this app holding a pending
+  // invite completes it the moment the clicked reply link broadcasts it
+  try{
+    NET.sig = new BroadcastChannel('jigsaw-together-signal');
+    NET.sig.onmessage = e => {
+      const m = e.data || {};
+      if(m.type === 'jt-reply' && m.code && NET.inviteP){
+        try{ NET.sig.postMessage({ type: 'jt-reply-ack' }); }catch(err){}
+        completeInvite(m.code).catch(() => {});
+      }
+    };
+  }catch(e){ /* no BroadcastChannel — the manual paste path still works */ }
   if(location.hash.startsWith('#j=')){
-    try{ pendingJoinCode = decodeURIComponent(location.hash.slice(3)); }catch(e){}
+    try{ pendingJoinCode = decodeURIComponent(location.hash.slice(3)); }catch(e){ pendingJoinCode = ''; }
     if(pendingJoinCode){
-      $('#bStartJoin').textContent = 'Join with the code from your link';
-      history.replaceState(null, '', location.pathname + location.search);
+      try{ history.replaceState(null, '', location.pathname + location.search); }catch(e){ /* file:// may refuse — the stale hash is harmless */ }
+      closeModal('#mStart');        // committed: straight to the one-button join view
+      openModal('#mJoin');
+      $('#joinLinkMode').hidden = false;
+      $('#joinPhase1').hidden = true;
+      $('#joinPhase2').hidden = true;
+      $('#joinInviter').textContent = 'A player invited you to a puzzle session.';
+      $('#joinName').value = localStorage.getItem('jt_name') || '';
+      decodeCode(pendingJoinCode).then(d => {
+        $('#joinInviter').textContent = (d.name || 'A player') + ' invited you to a puzzle session.';
+      }).catch(() => {
+        $('#joinStatus0').textContent = 'This invite link looks broken — open Join and paste it again.';
+      });
+    }
+  }else if(location.hash.startsWith('#r=')){
+    let rcode = '';
+    try{ rcode = decodeURIComponent(location.hash.slice(3)); }catch(e){}
+    if(rcode){
+      try{ history.replaceState(null, '', location.pathname + location.search); }catch(e){}
+      deliverReplyToInviterTab(rcode);
     }
   }
   updateRosterUI();
