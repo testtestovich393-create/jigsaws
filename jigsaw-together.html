@@ -3,29 +3,32 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Jigsaw Together — serverless multiplayer jigsaw</title>
+<title>Jigsaw Together — multiplayer jigsaw</title>
 <!--
   ============================================================================
-  JIGSAW TOGETHER — single-file, zero-dependency, serverless multiplayer jigsaw
+  JIGSAW TOGETHER — multiplayer jigsaw, host-as-server
   ============================================================================
-  Distribution: this one HTML file is the whole app. No build step, no npm,
-  no backend. Open it in any modern browser (double-click works), load any
-  picture, and play alone or share invite codes for realtime co-op.
+  The client is this one HTML file: no build step, no npm, no external
+  services. Opened as a plain file it plays solo. For multiplayer, one
+  player (the host) runs the zero-dependency server.js next to this file:
 
-  SERVERLESS MULTIPLAYER PROTOCOL (v1) — summary (full spec in NET section):
-  * Transport : WebRTC DataChannels (ordered+reliable), full mesh, plain JSON.
-  * Signaling : manual invite codes (compressed SDP+ICE) with ANY existing
-                member; afterwards members relay SDP between each other, so
-                the mesh self-completes with no server at all.
-  * Session   : no host, state fully replicated; lives while >=1 peer stays.
-                Anyone may join late (snapshot) or leave at any time.
-  * Locking   : per-piece-group optimistic lock, deterministic winner
-                (Lamport clock, then peer id). Loser is told to cancel.
-  * Motion    : while dragging, the anchor position streams at ~30 Hz;
-                remote peers interpolate it every frame.
-  * Media     : the picture travels peer-to-peer in 16 KB chunks, hash-checked.
-  * STUN only : public STUN servers help across NATs; on a LAN it works with
-                no internet at all. No TURN server is used or required.
+      node server.js      ->  open http://localhost:8090 (or the LAN address)
+
+  HOSTED MULTIPLAYER PROTOCOL (v2) — summary (full spec in NET section):
+  * Transport : one WebSocket per player to the host, plain JSON messages.
+  * Joining   : open the address, type a nickname, press Play. The server
+                answers "welcome" with id, roster and the latest board —
+                joining a running game takes zero extra steps.
+  * Referee   : the server grants piece locks ("gb" / "dn"), so two
+                players can never hold the same group; locks expire after
+                30 s without motion and are released on drop/disconnect.
+  * Motion    : while dragging, the anchor position streams at ~30 Hz
+                through the host; remote peers interpolate it every frame.
+  * Media     : the picture is uploaded to the host once (POST /image)
+                and fetched hash-checked by everyone else (GET /image).
+  * Persistence: the host stores picture + board on disk (quiet periodic
+                publishes) — the puzzle survives server restarts, and
+                pages reconnect by themselves.
   ============================================================================
 -->
 <style>
@@ -130,12 +133,10 @@ hr.s{border:none;border-top:1px solid var(--line);margin:14px 0}
 <canvas id="board"></canvas>
 
 <div class="topbar">
-  <div class="brand">Jigsaw Together<small>serverless co-op</small></div>
+  <div class="brand">Jigsaw Together<small>host &amp; play co-op</small></div>
   <div class="chip" id="playersChip" title="Connected players">
     <span class="dot" id="netDot"></span><span id="playersTxt">solo</span><span class="pdots" id="playerDots"></span>
   </div>
-  <button class="b" id="bInvite">Invite</button>
-  <button class="b" id="bJoin">Join</button>
   <button class="b" id="bNew">New game</button>
   <button class="b" id="bPic">Picture</button>
   <button class="b" id="bShuffle">Shuffle</button>
@@ -153,59 +154,18 @@ hr.s{border:none;border-top:1px solid var(--line);margin:14px 0}
 <!-- start -->
 <div class="modal on" id="mStart"><div class="panel">
   <div class="logo">Jigsaw <span>Together</span></div>
-  <div class="tag">A jigsaw puzzle you solve together. One file, no server, no accounts.<br>
-    Players connect directly, peer-to-peer, via invite codes.</div>
+  <div class="tag">A jigsaw puzzle you solve together — in real time.</div>
+  <p id="startMode" style="margin:0 0 14px;color:var(--tx2);font-size:12.5px"></p>
   <div class="col">
     <label class="f">Your nickname
       <input type="text" id="nameIn" maxlength="18" autocomplete="nickname">
     </label>
-    <button class="b acc" id="bStartNew">Start a new session</button>
-    <button class="b" id="bStartJoin">Join a session with a code</button>
+    <button class="b acc" id="bStartNew">Play</button>
     <button class="b" id="bContinue" hidden>Continue last session</button>
   </div>
-  <p style="margin-top:14px">Everything runs in your browser. The picture and the game live only on the
-  players' devices and are shared directly between them.</p>
-</div></div>
-
-<!-- invite (shown on the side of an existing player) -->
-<div class="modal" id="mInvite"><div class="panel">
-  <button class="x" data-close>&times;</button>
-  <h2>Invite a player</h2>
-  <p>Codes are exchanged through any channel you like (chat, e-mail, messenger, paper).</p>
-  <div class="step"><div class="stepn">1</div><div style="flex:1">
-    <p style="margin:0 0 6px">Send this <b>invite code</b> to the player who wants to join:</p>
-    <textarea class="code" id="invOffer" readonly placeholder="Generating invite code&hellip;"></textarea>
-    <div class="row" style="margin-top:6px"><button class="b" id="bInvCopy">Copy code</button>
-    <button class="b" id="bInvLink">Copy as link</button></div>
-  </div></div>
-  <div class="step"><div class="stepn">2</div><div style="flex:1">
-    <p style="margin:0 0 6px">Paste the <b>reply code</b> they send back, then connect:</p>
-    <textarea class="code" id="invAnswer" placeholder="Paste reply code here"></textarea>
-    <div class="row" style="margin-top:6px">
-      <button class="b acc" id="bInvConnect">Connect</button><span class="status" id="invStatus"></span>
-    </div>
-  </div></div>
-  <div class="hintbox">The newcomer will receive the current board and picture automatically.
-  After that first handshake all players link to each other directly (mesh), with no relay.</div>
-</div></div>
-
-<!-- join (shown on the newcomer side) -->
-<div class="modal" id="mJoin"><div class="panel">
-  <button class="x" data-close>&times;</button>
-  <h2>Join a session</h2>
-  <div class="step"><div class="stepn">1</div><div style="flex:1">
-    <p style="margin:0 0 6px">Paste the <b>invite code</b> you received:</p>
-    <textarea class="code" id="joinOffer" placeholder="JT1.&hellip;"></textarea>
-    <div class="row" style="margin-top:6px"><button class="b acc" id="bJoinGen">Generate reply</button>
-    <span class="status" id="joinStatus1"></span></div>
-  </div></div>
-  <div class="step"><div class="stepn">2</div><div style="flex:1">
-    <p style="margin:0 0 6px">Send this <b>reply code</b> back to the sender:</p>
-    <textarea class="code" id="joinReply" readonly placeholder="Your reply will appear here"></textarea>
-    <div class="row" style="margin-top:6px"><button class="b" id="bJoinCopy">Copy reply</button></div>
-  </div></div>
-  <p>As soon as they confirm, you will be connected directly and the current board
-  will be synced to you automatically.</p>
+  <p style="margin-top:14px">One player hosts: run <b>node server.js</b> next to this file and share
+  the address it prints. Everyone who opens it plays on the same board; the host keeps the game
+  safe between visits.</p>
 </div></div>
 
 <!-- new game -->
@@ -240,31 +200,31 @@ hr.s{border:none;border-top:1px solid var(--line);margin:14px 0}
   or pinch. A piece glows in a player's colour while they hold it &mdash; only one player can
   hold a group at a time. Pieces snap to each other when the fit is close, and to the frame
   when they reach their place.</p>
-  <p>Your board is saved automatically in this browser &mdash; close the tab any time and press
-  <b>Continue last session</b> on the next visit to pick up exactly where you left off
-  (pieces, picture and view are all kept on this device).</p>
-  <h3>Multiplayer without a server</h3>
+  <p>Your board is kept on the host machine &mdash; close the tab any time and come back to the same
+  puzzle; the game even survives a server restart. When the page is opened as a plain file (no server),
+  it plays solo and saves in this browser instead &mdash; press <b>Continue last session</b> on the next visit.</p>
+  <h3>Playing together</h3>
   <table class="kv">
-    <tr><td>Invite</td><td>Any player presses <b>Invite</b> and sends the code to a friend; the friend sends a reply code back. That single exchange is the whole signup.</td></tr>
-    <tr><td>Mesh</td><td>Right after joining, players introduce each other to everyone else and the session becomes a full peer-to-peer mesh of WebRTC channels. There is no host and no relay.</td></tr>
-    <tr><td>Session life</td><td>The session exists as long as at least one player keeps the page open. Everyone can leave and come back with a fresh invite at any time; late joiners receive the full board state.</td></tr>
-    <tr><td>Live moves</td><td>While you drag, piece positions stream to everyone ~30 times per second and are interpolated, so pieces glide on remote screens.</td></tr>
-    <tr><td>Locks</td><td>Grabbing a group locks it instantly. Two players grabbing the same group at the same moment resolve deterministically (earliest logical clock, then player id) &mdash; the loser feels the piece pulled away.</td></tr>
-    <tr><td>Picture</td><td>The image travels peer-to-peer in hash-checked chunks &mdash; it never touches any server.</td></tr>
+    <tr><td>Host</td><td>One player runs <b>node server.js</b> next to this file. It prints the address to open &mdash; for the host machine and for everyone on the same network.</td></tr>
+    <tr><td>Join</td><td>Open the address, type a nickname, press <b>Play</b>. If a game is running you drop straight into it; if the table is empty you pick a picture and start one. There are no codes and no invitations.</td></tr>
+    <tr><td>Session life</td><td>The host keeps the board on disk: close tabs, stop the server, reboot &mdash; when the server starts again the puzzle is back, and open pages reconnect by themselves.</td></tr>
+    <tr><td>Live moves</td><td>While you drag, piece positions stream through the host ~30 times per second and are interpolated, so pieces glide on other screens.</td></tr>
+    <tr><td>Locks</td><td>A grabbed group is locked by the host: only one player can hold a group, a late grab is refused and the piece shakes. Locks expire after 30&nbsp;s without motion and vanish on drop or disconnect.</td></tr>
+    <tr><td>Picture</td><td>The picture is uploaded to the host once and served to everyone; swapping it mid-game updates all players.</td></tr>
   </table>
   <h3>Network notes</h3>
-  <p>Connections are direct browser-to-browser (WebRTC). Public STUN servers are used only to discover
-  your address when players are behind different routers; on the same network the app works fully offline.
-  Some very restrictive corporate NATs can still block direct links (no TURN relay is used by design).</p>
+  <p>Everything runs on the host's machine &mdash; on a local network no internet is needed. Players from
+  other networks must be able to reach the host (port forwarding, VPN, or run the server on a small VPS).
+  No accounts, no external services, no data ever leaves the host machine.</p>
   <h3>Protocol in one table</h3>
   <table class="kv">
-    <tr><td>hi / bye</td><td>greet / leave on a channel</td></tr>
-    <tr><td>st_req &rarr; st</td><td>newcomer asks, peers answer, first snapshot wins</td></tr>
-    <tr><td>gb / m / dp</td><td>grab (lock) / motion stream / drop with snap result</td></tr>
-    <tr><td>dn</td><td>grab conflict: cancel your drag</td></tr>
-    <tr><td>rq / iq / so / sa</td><td>relayed introductions that complete the mesh</td></tr>
-    <tr><td>need_img &rarr; chunks</td><td>picture transfer, 16 KB frames, hash-verified</td></tr>
-    <tr><td>hb</td><td>heartbeat every 4 s; 12 s silence = left</td></tr>
+    <tr><td>hi / welcome</td><td>join; the server answers with id, roster and board snapshot</td></tr>
+    <tr><td>gb / dn</td><td>grab request / refused (another player holds the group)</td></tr>
+    <tr><td>m</td><td>motion stream while dragging (~30 Hz)</td></tr>
+    <tr><td>dp</td><td>drop with authoritative group positions</td></tr>
+    <tr><td>ng / sync / st</td><td>new game / picture swap / quiet periodic state publish</td></tr>
+    <tr><td>POST&middot;GET /image</td><td>picture uploaded once, fetched hash-checked by everyone else</td></tr>
+    <tr><td>players / jn / lf</td><td>roster updates; someone joined / left the table</td></tr>
   </table>
 </div></div>
 
@@ -341,39 +301,6 @@ function b64uDec(str){
   const bin = atob(str), out = new Uint8Array(bin.length);
   for(let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
-}
-
-/* ---- invite-code codec: JSON -> deflate-raw -> base64url ----
-   Uses the browser-native CompressionStream (no libraries). Falls back to
-   plain base64 (tag JT0) on older engines. */
-async function encodeCode(obj){
-  const raw = new TextEncoder().encode(JSON.stringify(obj));
-  if(typeof CompressionStream === 'function'){
-    try{
-      const cs = new CompressionStream('deflate-raw');
-      const w = cs.writable.getWriter(); w.write(raw); w.close();
-      const buf = await new Response(cs.readable).arrayBuffer();
-      return 'JT1.' + b64uEnc(new Uint8Array(buf));
-    }catch(e){ /* fall through */ }
-  }
-  return 'JT0.' + b64uEnc(raw);
-}
-async function decodeCode(str){
-  str = (str || '').trim().replace(/\s+/g, '');
-  const dot = str.indexOf('.');
-  if(dot < 1) throw new Error('Not a Jigsaw Together code');
-  const tag = str.slice(0, dot), body = b64uDec(str.slice(dot + 1));
-  let json;
-  if(tag === 'JT1'){
-    const ds = new DecompressionStream('deflate-raw');
-    const r = new Response(new Blob([body]).stream().pipeThrough(ds));
-    json = new TextDecoder().decode(await r.arrayBuffer());
-  }else if(tag === 'JT0'){
-    json = new TextDecoder().decode(body);
-  }else throw new Error('Unknown code version: ' + tag);
-  const obj = JSON.parse(json);
-  if(!obj || !obj.sdp || (obj.t !== 'o' && obj.t !== 'a')) throw new Error('Malformed code payload');
-  return obj;
 }
 
 /* ---- toasts ---- */
@@ -1264,273 +1191,205 @@ function newGame(opts){
   saveSoon();
 }
 /* ==========================================================================
-   PART 4 — SERVERLESS MULTIPLAYER PROTOCOL  (JTP/1)
+   PART 4 — MULTIPLAYER TRANSPORT (host-as-server)
    ==========================================================================
-   Design goals: no server, no accounts, no relay; anyone may join or leave
-   at any time; the session dies only when the last player closes the tab;
-   realtime motion while dragging; consistent locks without a referee.
+   One player (the host) runs server.js — a tiny zero-dependency Node
+   process that serves this page and relays the game. Everyone who opens
+   the server's address joins the same table: no codes, no invitations,
+   no peer-to-peer negotiation.
 
    TOPOLOGY
-   ......... WebRTC DataChannels (ordered, reliable, JSON text + raw binary
-   for picture chunks). Every player keeps a direct channel to every other
-   player (full mesh). Game state is fully replicated on every peer, so
-   there is no host: any peer can serve a snapshot to a newcomer, and the
-   session outlives any individual player.
+   ......... one WebSocket per player to the host (ws(s)://<host>/ws).
+   The server is the referee: it owns the roster and the piece locks and
+   it relays game messages to everyone else. Board state is replicated
+   on every client exactly as before, so rendering stays fully local.
 
-   JOIN FLOW (the only manual step)
-   1. Any member M clicks Invite -> produces an invite CODE containing
-      M's SDP offer + gathered ICE candidates (deflate-raw + base64url,
-      tag "JT1"). No trickle: the code is a single self-contained string.
-   2. Newcomer N pastes the code, gets a reply CODE (SDP answer) and sends
-      it back over any channel (chat, email...).
-   3. M pastes the reply -> the M-N DataChannel opens.
-
-   MESH COMPLETION (fully automatic, still serverless)
-   4. N asks for state ("st_req"); every member answers with a staggered
-      snapshot; N applies the first one (positions, groups, locks, z-order,
-      puzzle definition, player roster).
-   5. If the picture bytes are missing, N broadcasts "need_img"; a peer
-      holding the exact hash streams it in 16 KB binary frames with
-      backpressure (bufferedAmountLow) and a checksum (fnv1a 2x32).
-   6. Each peer periodically compares "players I know" vs "channels I have"
-      and repairs the mesh: to reach P it asks any connected peer R to
-      relay an SDP offer ("rq" -> "iq" -> "so" -> "sa"). The receiver of an
-      introduction makes the offer. Duplicates are resolved by keeping the
-      first live channel per peer id. Result: everyone connects to everyone
-      with zero further manual steps.
-
-   LIVENESS
-   7. "hb" heartbeat every 4 s; 12 s of silence (or a close event) drops the
-      peer, releases the locks it held and triggers mesh repair. "bye" is
-      sent on graceful unload.
+   JOIN FLOW (fully automatic)
+   1. Opening the page connects the socket and says "hi"; the server
+      answers "welcome" with your id, the roster, picture metadata and
+      the latest board snapshot (if a game is running).
+   2. Game running -> you are dropped straight into it; a missing picture
+      is fetched from the host with GET /image and hash-checked.
+   3. Empty table -> the first player picks a picture and starts; the
+      picture is uploaded once (POST /image) and the game is broadcast.
 
    LOCKS & CONCURRENCY
-   8. Grabbing group G sends "gb {g, clk, z}". Every peer applies the same
-      rule: the claim with the smallest (Lamport clk, peer id) tuple wins.
-      The rule is commutative, so all peers converge without a referee; the
-      loser receives "dn" and its drag is cancelled back to the grab point.
-   9. While dragging, the grabber streams "m {g, x, y}" (anchor position,
-      ~30 Hz). Receivers ease their copy toward the target every frame, and
-      only accept motion from the current lock holder.
-   10. Dropping sends "dp" with authoritative positions of the whole group
-      (merging groups included). Snapping is computed by the dropper only,
-      so no snap conflicts are possible.
+   4. Grabbing sends "gb"; the server grants the lock or refuses ("dn")
+      when another player holds it. Locks expire after 30 s without
+      motion and are released on drop or disconnect — no dead locks.
+   5. While dragging, the anchor position streams as "m" (~30 Hz); the
+      server refreshes the lock lease on every move and relays the
+      motion; receivers ease their copy toward it every frame.
+   6. Dropping sends "dp" with authoritative positions of the group;
+      snapping is computed by the dropper only, so no snap conflicts.
 
-   PUZZLE DEFINITION
-   11. A game is {seed, cols, rows, W, H, imgHash, imgName}. Edge shapes are
-       a pure function of (seed, edge coordinates), so every peer generates
-       bit-identical geometry locally; only positions ever travel.
+   BOARD STATE / PERSISTENCE
+   7. New games ("ng"), picture swaps ("sync") and a quiet periodic
+      publish ("st", every 10 s from the lowest player id) are stored on
+      the server, so late joiners and server restarts restore the board.
+   8. The server saves picture + board to disk and reloads them on
+      start; the puzzle survives the host closing and reopening it.
+   9. A dropped socket reconnects automatically with backoff; after a
+      "welcome" the board is re-applied and play continues.
    ========================================================================== */
 
 const NET = {
-  peers: new Map(),          // peerId -> P {id, name, pc, dc, lastHb, tx, rx}
-  inviteP: null,             // outstanding manual invite (opener side)
-  pendingIntro: new Map(),   // peerId -> {ts, n}  rq retry pacing
-  offering: new Set(),       // peerIds with our SDP offer in flight
-  remoteAnchors: new Map(),  // gid -> {ax, ay, tx, ty} eased motion targets
+  ws: null,
+  connected: false,         // socket open AND welcomed by the server
+  solo: true,               // true = no server (page opened as a file)
+  id: null,                 // player id assigned by the server
+  players: new Map(),       // server roster: id -> {name}
+  remoteAnchors: new Map(), // gid -> {ax, ay, tx, ty} eased motion targets
+  lastWelcome: null,        // last "welcome" (tells whether a game is running)
+  uploadedHash: '',         // picture bytes already present on the host
+  retries: 0,
+  wantReconnect: false,
+  welcomedOnce: false,
 };
 
-const RTC_CFG = {
-  iceServers: [
-    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-    { urls: 'stun:stun.cloudflare.com:3478' }
-  ]
-};
-const HB_MS = 4000, HB_TIMEOUT = 12000, CHUNK = 16384;
-
-function newPc(){
-  const pc = new RTCPeerConnection(RTC_CFG);
-  pc.onconnectionstatechange = () => {
-    if(pc.connectionState === 'failed' || pc.connectionState === 'closed'){
-      for(const p of [...NET.peers.values()]) if(p.pc === pc) dropPeer(p, true);
-      if(NET.inviteP && NET.inviteP.pc === pc) NET.inviteP = null;
-    }
-  };
-  return pc;
-}
-function gathered(pc){
-  if(pc.iceGatheringState === 'complete') return Promise.resolve();
-  return new Promise(res => {
-    const to = setTimeout(res, 2500);
-    const ch = () => {
-      if(pc.iceGatheringState === 'complete'){
-        clearTimeout(to);
-        pc.removeEventListener('icegatheringstatechange', ch);
-        res();
-      }
-    };
-    pc.addEventListener('icegatheringstatechange', ch);
-  });
-}
-
-function openPeerStub(id){
-  let p = NET.peers.get(id);
-  if(!p){
-    p = { id, name: '?', pc: null, dc: null, lastHb: 0, tx: null, rx: null };
-    NET.peers.set(id, p);
+/* ---------------- outgoing ---------------- */
+NET.bcast = function(msg){
+  if(NET.ws && NET.ws.readyState === 1){
+    try{ NET.ws.send(JSON.stringify(msg)); }catch(e){}
   }
-  return p;
-}
-function connectedPeers(){
+};
+NET.connectedIds = function(){
+  if(!NET.connected) return [];
   const out = [];
-  for(const p of NET.peers.values()) if(p.dc && p.dc.readyState === 'open') out.push(p);
+  for(const id of NET.players.keys()) if(id !== NET.id) out.push(id);
   return out;
-}
-NET.connectedIds = () => connectedPeers().map(p => p.id);
-function isConnected(id){ return NET.connectedIds().indexOf(id) !== -1; }
-function sendTo(id, msg){
-  for(const p of connectedPeers()) if(p.id === id){
-    try{ p.dc.send(JSON.stringify(msg)); NET.sentOk = (NET.sentOk || 0) + 1; }catch(e){}
-    return true;
-  }
-  NET.sentMiss = (NET.sentMiss || 0) + 1;
-  return false;
-}
-function bcastRaw(msg){
-  for(const p of connectedPeers()){ try{ p.dc.send(JSON.stringify(msg)); }catch(e){} }
-}
-NET.bcast = bcastRaw;
-NET.remoteAnchors = NET.remoteAnchors; // (documented above)
+};
 
-/* keep at most one live channel per peer id; returns false if duplicate */
-function registerLive(P){
-  if(!P.id) return false;
-  const ex = NET.peers.get(P.id);
-  if(ex && ex !== P && ex.dc && ex.dc.readyState === 'open'){
-    try{ P.dc.close(); }catch(e){}
-    try{ P.pc && P.pc.close(); }catch(e){}
-    return false;
-  }
-  NET.peers.set(P.id, P);
-  NET.pendingIntro.delete(P.id);
-  if(NET.inviteP === P) NET.inviteP = null; // manual handshake completed
-  updateRosterUI();
-  setTimeout(ensureMesh, 500);
-  return true;
-}
-
-function wireChannel(P, dc){
-  dc.binaryType = 'arraybuffer';
-  P.dc = dc;
-  dc.onopen = () => {
-    P.lastHb = Date.now();
-    try{ dc.send(JSON.stringify({ t: 'hi', id: S.me.id, name: S.me.name })); }catch(e){}
-    if(P.id) registerLive(P);
-    if(!S.started){ try{ dc.send(JSON.stringify({ t: 'st_req' })); }catch(e){} }
-    startHeartbeat();
+/* ---------------- connection & reconnect ---------------- */
+function netConnect(){
+  if(NET.ws) return;
+  const l = location;
+  if(l.protocol !== 'http:' && l.protocol !== 'https:'){ NET.solo = true; return; }
+  NET.solo = false;
+  NET.wantReconnect = true;
+  let ws;
+  try{ ws = new WebSocket((l.protocol === 'https:' ? 'wss://' : 'ws://') + l.host + '/ws'); }
+  catch(e){ NET.solo = true; return; }
+  NET.ws = ws;
+  ws.onopen = () => {
+    NET.retries = 0;
+    try{ ws.send(JSON.stringify({ t: 'hi', name: S.me.name })); }catch(e){}
   };
-  dc.onmessage = e => {
-    P.lastHb = Date.now();
-    if(typeof e.data === 'string'){
-      let m; try{ m = JSON.parse(e.data); }catch(err){ return; }
-      handleMsg(P, m);
-    }else handleBin(P, e.data);
+  ws.onmessage = e => {
+    let m; try{ m = JSON.parse(e.data); }catch(err){ return; }
+    if(m && typeof m === 'object') handleServer(m);
   };
-  dc.onclose = () => dropPeer(P);
-  dc.onerror = () => {};
-}
-
-/* ---------------- manual invite codes ---------------- */
-async function createInvite(){
-  if(NET.inviteP) throw new Error('An invite is already being generated');
-  const pc = newPc();
-  const dc = pc.createDataChannel('jz');
-  const P = { id: null, name: '?', pc, dc, lastHb: Date.now(), tx: null, rx: null };
-  NET.inviteP = P;
-  wireChannel(P, dc);
-  await pc.setLocalDescription(await pc.createOffer());
-  await gathered(pc);
-  const code = await encodeCode({
-    t: 'o', from: S.me.id, name: S.me.name,
-    sdp: { type: pc.localDescription.type, sdp: pc.localDescription.sdp }
-  });
-  return code;
-}
-async function acceptInviteCode(code){
-  const d = await decodeCode(code);
-  if(d.t !== 'o') throw new Error('That is an invite code, not a reply');
-  const pc = newPc();
-  const P = { id: d.from, name: d.name || '?', pc, dc: null, lastHb: 0, tx: null, rx: null };
-  pc.ondatachannel = e => { P.dc = e.channel; wireChannel(P, e.channel); };
-  await pc.setRemoteDescription(d.sdp);
-  await pc.setLocalDescription(await pc.createAnswer());
-  await gathered(pc);
-  return encodeCode({
-    t: 'a', from: S.me.id, name: S.me.name,
-    sdp: { type: pc.localDescription.type, sdp: pc.localDescription.sdp }
-  });
-}
-async function completeInvite(code){
-  const d = await decodeCode(code);
-  if(d.t !== 'a') throw new Error('That is a reply code? expected reply — got invite');
-  const P = NET.inviteP;
-  if(!P || !P.pc) throw new Error('No pending invite — generate one first');
-  await P.pc.setRemoteDescription(d.sdp);
-}
-
-/* ---------------- message handling ---------------- */
-function handleMsg(P, m){
-  if(!m || typeof m !== 'object') return;
-  NET.rx = NET.rx || {};
-  NET.rx[m.t] = (NET.rx[m.t] || 0) + 1;
-
-  // relayed signalling: forward messages addressed to someone else
-  if((m.t === 'rq' || m.t === 'so' || m.t === 'sa') && m.to && m.to !== S.me.id){
-    NET.fwd = NET.fwd || { n: 0, sent: 0, noch: 0 };
-    NET.fwd.n++;
-    if(isConnected(m.to)){ NET.fwd.sent++; sendTo(m.to, m); }
-    else NET.fwd.noch++;
-    return;
-  }
-
-  switch(m.t){
-    case 'hi': {
-      P.name = (m.name || 'player').slice(0, 18);
-      P.id = m.id;
-      if(!registerLive(P)) return;
-      const isNew = !S.players.has(P.id);
-      S.players.set(P.id, { name: P.name, lastSeen: Date.now() });
-      if(isNew){ SFX.join(); toast(P.name + ' joined the session', 'ok'); }
-      updateRosterUI();
-      bcastPlayers();
-      break;
+  ws.onclose = () => {
+    NET.ws = null;
+    NET.connected = false;
+    updateRosterUI();
+    if(!NET.wantReconnect) return;
+    NET.retries++;
+    if(NET.retries === 1) toast('Connection lost — reconnecting…', 'err');
+    if(!NET.lastWelcome && NET.retries >= 3){
+      // nothing ever answered: this page was not served by a game server
+      NET.solo = true;
+      NET.wantReconnect = false;
+      toast('No game server found here — playing solo', 'err', 4200);
+      return;
     }
-    case 'bye':
-      if(P.id) toast((P.name || 'player') + ' left the session');
-      dropPeer(P, true);
-      break;
-    case 'hb': break;
-    case 'st_req': answerStateReq(P); break;
-    case 'st':
-      if(!S.started && m.st){ applyState(m.st); toast('Board synced — have fun', 'ok'); }
-      break;
-    case 'sync':
-      if(m.st){ applyState(m.st); toast(P.name + ' updated the game', 'ok'); }
-      break;
-    case 'need_img':
-      if(S.imgBytes && S.imgHash === m.hash) sendImageTo(P);
-      break;
-    case 'im_meta': startRxImage(P, m); break;
-    case 'im_end': finishRxImage(P, m); break;
+    const delay = Math.min(5000, 400 * Math.pow(1.6, Math.min(NET.retries, 8)));
+    setTimeout(netConnect, delay);
+  };
+  ws.onerror = () => {};
+}
 
-    case 'gb': { // grab (lock) request — deterministic winner everywhere
-      S.clk = Math.max(S.clk, m.clk) + 1;
-      const cur = S.locks.get(m.g);
-      const win = !cur || m.clk < cur.clk || (m.clk === cur.clk && P.id < cur.peer);
-      if(win){
-        S.locks.set(m.g, { peer: P.id, clk: m.clk });
-        S.zTop = Math.max(S.zTop, m.z || 0);
-        raiseGroup(m.g, S.zTop);
-        const a = S.pieces.get(m.g);
-        if(a) NET.remoteAnchors.set(m.g, { ax: a.x, ay: a.y, tx: a.x, ty: a.y });
-      }else{
-        try{ P.dc.send(JSON.stringify({ t: 'dn', g: m.g })); }catch(e){}
+function leaveSession(){
+  NET.bcast({ t: 'bye' });
+  NET.wantReconnect = false;
+  try{ if(NET.ws) NET.ws.close(); }catch(e){}
+}
+
+/* ---------------- server messages ---------------- */
+function handleServer(m){
+  switch(m.t){
+    case 'welcome': {
+      NET.connected = true;
+      NET.lastWelcome = m;
+      if(!NET.welcomedOnce){ NET.welcomedOnce = true; NET.reconnects = 0; }
+      else NET.reconnects = (NET.reconnects || 0) + 1;
+      NET.id = m.id;
+      S.me.id = m.id;
+      S.me.color = colorOf(S.me.id);
+      S.players = new Map();
+      NET.players = new Map();
+      for(const row of (m.players || [])){
+        const id = row[0], name = row[1];
+        NET.players.set(id, { name });
+        if(id !== NET.id) S.players.set(id, { name, lastSeen: Date.now() });
+      }
+      NET.players.set(NET.id, { name: S.me.name });
+      updateRosterUI();
+      const st = m.st;
+      if(st && st.puzzle){
+        // a game is running — join it with zero presses; keep the name we
+        // arrived with so returning players stay themselves
+        closeModal('#mStart');
+        try{ localStorage.setItem('jt_name', S.me.name); }catch(e){}
+        applyState(st);
+        toast(NET.reconnects ? 'Reconnected — board restored' : 'Joined the table — have fun', 'ok');
+      }else if(S.started && S.puzzle){
+        // the server lost its state (fresh restart without a save):
+        // put our board back and become the publisher
+        ensureImageUploaded().then(() => NET.bcast({ t: 'ng', st: makeState() }));
       }
       break;
     }
-    case 'm': { // motion stream — only from the lock holder
+    case 'jn': {
+      S.players.set(m.id, { name: m.name, lastSeen: Date.now() });
+      NET.players.set(m.id, { name: m.name });
+      toast(m.name + ' joined the table', 'ok');
+      SFX.join();
+      updateRosterUI();
+      break;
+    }
+    case 'lf': {
+      const pl = S.players.get(m.id);
+      S.players.delete(m.id);
+      NET.players.delete(m.id);
+      for(const [g, lk] of [...S.locks]){
+        if(lk.peer === m.id){ S.locks.delete(g); NET.remoteAnchors.delete(g); }
+      }
+      if(pl){ toast(pl.name + ' left the table'); SFX.leave(); }
+      updateRosterUI();
+      break;
+    }
+    case 'players': {
+      for(const row of (m.ps || [])){
+        const id = row[0], name = row[1];
+        if(id === NET.id) continue;
+        const ex = S.players.get(id);
+        if(ex){ ex.name = name; ex.lastSeen = Date.now(); }
+        else { S.players.set(id, { name, lastSeen: Date.now() }); }
+        NET.players.set(id, { name });
+      }
+      updateRosterUI();
+      break;
+    }
+    case 'gb': {          // someone (maybe re-)grabbed: server already arbitrated
+      S.clk = Math.max(S.clk, (m.clk || 0) + 1);
+      S.locks.set(m.g, { peer: m.peer, clk: m.clk || 0 });
+      S.zTop = Math.max(S.zTop, m.z || 0);
+      raiseGroup(m.g, S.zTop);
+      const a = S.pieces.get(m.g);
+      if(a && m.peer !== S.me.id){
+        NET.remoteAnchors.set(m.g, { ax: a.x, ay: a.y, tx: a.x, ty: a.y });
+      }
+      break;
+    }
+    case 'dn': {          // our grab was refused — cancel our local drag
       const lk = S.locks.get(m.g);
-      if(lk && lk.peer === P.id){
+      if(!lk || lk.peer === S.me.id) forceCancelDrag(m.g);
+      break;
+    }
+    case 'm': {           // motion stream — only meaningful from the lock holder
+      const lk = S.locks.get(m.g);
+      if(lk && lk.peer === m.peer){
         const a = S.pieces.get(m.g);
         let an = NET.remoteAnchors.get(m.g);
         if(!an){
@@ -1541,245 +1400,62 @@ function handleMsg(P, m){
       }
       break;
     }
-    case 'dp': applyDrop(m, P.id); break;
-    case 'dn': forceCancelDrag(m.g); break;
-    case 'pr': { // roster merge — everyone learns everyone, mesh can self-complete
-      let changed = false;
-      for(const row of (m.ps || [])){
-        const id = row[0];
-        if(id === S.me.id) continue;
-        const ex = S.players.get(id);
-        if(!ex){ S.players.set(id, { name: (row[1] || 'player').slice(0, 18), lastSeen: Date.now() }); changed = true; }
-        else ex.lastSeen = Date.now();
-      }
-      if(changed){ updateRosterUI(); setTimeout(ensureMesh, 400); }
+    case 'dp': applyDrop(m, m.peer); break;
+    case 'ng': {
+      applyState(m.st);
+      toast(m.from ? m.from + ' dealt a new game' : 'New game dealt', 'ok');
       break;
     }
-
-    case 'rq': { // A asks me (or asks me to forward) for an introduction to m.to
-      if(m.to === S.me.id){
-        maybeIntroOffer(m.from, P.id);
-      }else if(isConnected(m.to)){
-        sendTo(m.to, m);
-      }
+    case 'sync': {
+      applyState(m.st);
+      toast(m.from ? m.from + ' updated the picture' : 'Picture updated', 'ok');
       break;
     }
-    case 'iq': // I am asked to offer a connection to m.from
-      maybeIntroOffer(m.from, P.id);
-      break;
-    case 'so': // SDP offer for me (from m.from), delivered via m.via
-      acceptIntroOffer(P, m);
-      break;
-    case 'sa': { // SDP answer for my earlier offer
-      const T = NET.peers.get(m.from);
-      if(T && T.pc && T.pc.signalingState === 'have-local-offer'){
-        T.pc.setRemoteDescription(m.sdp).catch(() => {});
-      }
-      break;
-    }
+    case 'err': toast(m.msg || 'Server error', 'err', 3600); break;
+    case 'full': toast('The table is full — try again later', 'err', 4200); break;
   }
 }
 
-/* ---------------- staggered snapshot answering ---------------- */
-function answerStateReq(P){
-  if(!S.started || !S.puzzle) return;
-  const ranks = connectedPeers().map(p => p.id).sort();
-  const rank = Math.max(0, ranks.indexOf(S.me.id));
-  setTimeout(() => {
-    if(S.started && P.dc && P.dc.readyState === 'open'){
-      try{ P.dc.send(JSON.stringify({ t: 'st', st: makeState() })); }catch(e){}
-    }
-  }, 60 + rank * 140);
-}
-
-/* ---------------- automatic mesh repair ----------------
-   pendingIntro = retry pacing for introduction REQUESTS (rq).
-   offering     = a real SDP offer is in flight for this peer; used for
-                  glare control. Glare rule: the LOWER peer id keeps its own
-                  offer, the higher id cancels and accepts the incoming one. */
-function ensureMesh(){
-  if(!S.started) return;
-  NET.meshTicks = (NET.meshTicks || 0) + 1;
-  const t = Date.now();
-  for(const [id, rec] of [...NET.pendingIntro]){
-    if(t - rec.ts > 20000) NET.pendingIntro.delete(id);
-  }
-  const connected = new Set(NET.connectedIds());
-  const relays = [...connected].sort();
-  if(!relays.length) return;
-  for(const id of S.players.keys()){
-    if(id === S.me.id || connected.has(id) || NET.offering.has(id)) continue;
-    const rec = NET.pendingIntro.get(id);
-    if(rec){
-      if(t - rec.ts < 8000) continue;
-      rec.ts = t; rec.n = (rec.n || 1) + 1;
-    }else{
-      NET.pendingIntro.set(id, { ts: t, n: 1 });
-      if(S.me.id < id) continue; // the other side initiates first
-    }
-    const relay = relays.find(r => r !== id) || relays[0];
-    sendTo(relay, { t: 'rq', to: id, from: S.me.id, name: S.me.name });
-  }
-}
-function cancelOffer(id){
-  const P = NET.peers.get(id);
-  if(P && P.pc){ try{ P.pc.close(); }catch(e){} }
-  NET.offering.delete(id);
-}
-function maybeIntroOffer(targetId, viaId){
-  if(!targetId || targetId === S.me.id || isConnected(targetId)) return;
-  if(NET.offering.has(targetId)){
-    if(S.me.id < targetId) return; // my offer wins the glare
-    cancelOffer(targetId);         // their offer wins — drop mine
-  }
-  introOffer(targetId, viaId);
-}
-async function introOffer(targetId, viaId){
-  NET.offering.add(targetId);
-  NET.offers = (NET.offers || 0) + 1;
-  try{
-    const pc = newPc();
-    const dc = pc.createDataChannel('jz');
-    const P = openPeerStub(targetId);
-    if(P.dc && P.dc.readyState === 'open'){ // raced, already connected
-      try{ pc.close(); }catch(e){}
-      NET.offering.delete(targetId);
-      return;
-    }
-    P.pc = pc; P.name = P.name || '?';
-    wireChannel(P, dc);
-    await pc.setLocalDescription(await pc.createOffer());
-    await gathered(pc);
-    sendTo(viaId, { t: 'so', to: targetId, from: S.me.id, via: viaId,
-      sdp: { type: pc.localDescription.type, sdp: pc.localDescription.sdp } });
-    setTimeout(() => {
-      if(!isConnected(targetId)) cancelOffer(targetId);
-    }, 15000);
-  }catch(e){ NET.offering.delete(targetId); }
-}
-async function acceptIntroOffer(viaP, m){
-  const from = m.from;
-  NET.answers = (NET.answers || 0) + 1;
-  if(!from || from === S.me.id || isConnected(from)) return;
-  if(NET.offering.has(from)){
-    if(S.me.id < from) return; // keep my own offer
-    cancelOffer(from);
-  }
-  try{
-    const pc = newPc();
-    const P = openPeerStub(from);
-    P.pc = pc;
-    pc.ondatachannel = e => { P.dc = e.channel; wireChannel(P, e.channel); };
-    await pc.setRemoteDescription(m.sdp);
-    await pc.setLocalDescription(await pc.createAnswer());
-    await gathered(pc);
-    sendTo(viaP.id, { t: 'sa', to: from, from: S.me.id, via: viaP.id,
-      sdp: { type: pc.localDescription.type, sdp: pc.localDescription.sdp } });
-  }catch(e){ if(NET.peers.get(from)) NET.peers.get(from).pc = null; }
-}
-
-/* ---------------- roster sharing ---------------- */
-function bcastPlayers(){
-  const ps = [...S.players].map(([id, pl]) => [id, pl.name]);
-  bcastRaw({ t: 'pr', ps });
-}
-
-/* ---------------- heartbeat / leave ---------------- */
-function startHeartbeat(){
-  if(NET.hbTimer) return;
-  NET.hbTimer = setInterval(() => {
-    const t = Date.now();
-    bcastRaw({ t: 'hb' });
-    for(const p of [...NET.peers.values()]){
-      if(p.dc && p.dc.readyState === 'open' && t - p.lastHb > HB_TIMEOUT){
-        try{ p.pc && p.pc.close(); }catch(e){}
-        try{ p.dc.close(); }catch(e){}
-        dropPeer(p);
-      }
-    }
-  }, HB_MS);
-}
-function leaveSession(){ // graceful goodbye on unload
-  bcastRaw({ t: 'bye' });
-}
-function dropPeer(P, silent){
-  if(P.id){
-    if(NET.peers.get(P.id) === P) NET.peers.delete(P.id);
-    NET.pendingIntro.delete(P.id);
-    NET.offering.delete(P.id);
-    for(const [g, lk] of [...S.locks]){
-      if(lk.peer === P.id){ S.locks.delete(g); NET.remoteAnchors.delete(g); }
-    }
-    S.players.delete(P.id);
-  }
-  P.tx = null; P.rx = null;
-  if(NET.inviteP === P) NET.inviteP = null;
-  updateRosterUI();
-  if(!silent && P.id){ toast((P.name || 'player') + ' left the session'); SFX.leave(); }
-  setTimeout(ensureMesh, 600);
-}
-
-/* ---------------- picture transfer (peer-to-peer, hash-checked) ---------------- */
-function requestImage(){
+/* ---------------- picture over HTTP (host keeps one copy) ---------------- */
+NET.requestImage = function(){
   if(!S.puzzle || !S.puzzle.imgHash) return;
   if(S.imgBytes && S.imgHash === S.puzzle.imgHash){ onImageReady(); return; }
-  bcastRaw({ t: 'need_img', hash: S.puzzle.imgHash });
-}
-NET.requestImage = requestImage;
+  if(NET.solo || !NET.connected) return;
+  fetch('/image').then(r => {
+    if(!r.ok) throw new Error('no picture on the host yet');
+    const nm = r.headers.get('x-jz-name');
+    return r.arrayBuffer().then(buf => ({ buf, nm }));
+  }).then(({ buf, nm }) => {
+    const bytes = new Uint8Array(buf);
+    if(S.puzzle && hashBytes(bytes) !== S.puzzle.imgHash) throw new Error('checksum');
+    return applyImageBytes(bytes, nm ? decodeURIComponent(nm) : 'picture');
+  }).then(() => {
+    toast('Picture received from the host', 'ok');
+  }).catch(() => {
+    setTimeout(() => {
+      if(S.puzzle && (!S.imgBytes || S.imgHash !== S.puzzle.imgHash)) NET.requestImage();
+    }, 1500);
+  });
+};
 
-function sendImageTo(P){
-  if(!S.imgBytes || !P.dc || P.dc.readyState !== 'open' || P.tx) return;
+async function uploadImage(bytes, name){
+  const r = await fetch('/image', {
+    method: 'POST',
+    headers: { 'X-Jz-Name': encodeURIComponent(name || 'picture') },
+    body: bytes
+  });
+  if(!r.ok) throw new Error('The host refused the picture (' + r.status + ')');
+}
+async function ensureImageUploaded(){
+  if(NET.solo || !NET.connected || !S.imgBytes) return;
+  if(NET.uploadedHash === S.imgHash) return;
   try{
-    P.dc.send(JSON.stringify({ t: 'im_meta', hash: S.imgHash, name: S.imgName, size: S.imgBytes.length }));
-    P.tx = { i: 0, bytes: S.imgBytes };
-    pumpImage(P);
-  }catch(e){}
-}
-function pumpImage(P){
-  const dc = P.dc;
-  if(!P.tx || !dc || dc.readyState !== 'open'){ P.tx = null; return; }
-  while(P.tx.i < P.tx.bytes.length){
-    if(dc.bufferedAmount > 512 * 1024){
-      dc.bufferedAmountLowThreshold = 256 * 1024;
-      dc.onbufferedamountlow = () => { dc.onbufferedamountlow = null; pumpImage(P); };
-      return;
-    }
-    const end = Math.min(P.tx.i + CHUNK, P.tx.bytes.length);
-    try{ dc.send(P.tx.bytes.subarray(P.tx.i, end)); }catch(e){ return; }
-    P.tx.i = end;
-  }
-  P.tx = null;
-  try{ dc.send(JSON.stringify({ t: 'im_end', hash: S.imgHash })); }catch(e){}
-}
-function handleBin(P, buf){
-  if(P.rx && P.rx.parts){
-    P.rx.parts.push(buf);
-    P.rx.got += buf.byteLength;
-  }
-}
-function startRxImage(P, m){
-  if(P.rx) return;
-  if(S.imgHash === m.hash) return; // already have it
-  P.rx = { hash: m.hash, name: m.name, size: m.size, parts: [], got: 0 };
-}
-function finishRxImage(P, m){
-  const rx = P.rx; P.rx = null;
-  if(!rx || rx.hash !== m.hash) return;
-  if(rx.got !== rx.size){ toast('Picture transfer was cut short — retrying', 'err'); setTimeout(requestImage, 700); return; }
-  const total = new Uint8Array(rx.got);
-  let off = 0;
-  for(const part of rx.parts){ total.set(new Uint8Array(part), off); off += part.byteLength; }
-  if(hashBytes(total) !== rx.hash){
-    toast('Picture checksum mismatch — retrying', 'err');
-    setTimeout(requestImage, 700);
-    return;
-  }
-  applyImageBytes(total, rx.name)
-    .then(() => toast('Picture received from ' + (P.name || 'peer'), 'ok'))
-    .catch(e => toast(e.message, 'err'));
+    await uploadImage(S.imgBytes, S.imgName);
+    NET.uploadedHash = S.imgHash;
+  }catch(e){ toast(e.message, 'err'); }
 }
 
-/* set a new picture at runtime (creator side) and let everyone follow */
+/* ---------------- picture application (local) ---------------- */
 async function applyImageBytes(bytes, name){
   const loaded = await loadImageFromBytes(bytes, name);
   S.img = loaded;
@@ -1793,12 +1469,23 @@ async function applyImageBytes(bytes, name){
   return true;
 }
 function onImageReady(){
-  if(NET.imgTimer){ clearInterval(NET.imgTimer); NET.imgTimer = null; }
   if(S.puzzle) fitCamera();
   saveSoon();
 }
+
+/* ---------------- periodic state publish ----------------
+   The lowest player id publishes every 10 s so the server always holds
+   a recent board for late joiners and for restarts. */
+function publishState(){
+  if(NET.connected && S.started && S.puzzle) NET.bcast({ t: 'st', st: makeState() });
+}
+setInterval(() => {
+  if(!NET.connected || !S.started || !NET.id) return;
+  const ids = [NET.id].concat(NET.connectedIds()).sort();
+  if(ids[0] === NET.id) publishState();
+}, 10000);
 /* ==========================================================================
-   PART 5 — UI wiring, boot, persistence, debug hooks
+   PART 5 — UI wiring, boot, solo persistence, debug hooks
    ========================================================================== */
 
 function openModal(sel){ $(sel).classList.add('on'); }
@@ -1825,12 +1512,25 @@ function updateRosterUI(){
   }
 }
 
+/* click the players chip to rename yourself (auto-joined players never
+   saw the start dialog, so this is their nickname editor) */
+$('#playersChip').addEventListener('click', () => {
+  if(!NET.connected) return;
+  const nm = prompt('Your nickname', S.me.name);
+  if(nm === null) return;
+  S.me.name = nm.trim().replace(/[\x00-\x1f\x7f]/g, '').slice(0, 18) || S.me.name;
+  try{ localStorage.setItem('jt_name', S.me.name); }catch(e){}
+  NET.bcast({ t: 'name', name: S.me.name });
+});
+
 /* ---------------- persistence ----------------
-   The whole session (picture bytes included, full size) lives in IndexedDB
-   and survives closing the tab or the browser. localStorage is kept as a
-   fallback (private mode, blocked IDB) and for the synchronous unload-time
-   save, where an async IDB write might not flush. Locks are NOT saved:
-   they are ephemeral — after a reload everyone re-grabs freely. */
+   When the page is served by server.js, the HOST keeps the save on disk
+   and hands it to every client on connect — the browser copy below is
+   only used in solo mode (page opened as a plain file). The whole solo
+   session (picture bytes included, full size) lives in IndexedDB and
+   survives closing the tab or the browser; localStorage is the fallback
+   and the synchronous unload-time save. Locks are NOT saved: they are
+   ephemeral — after a reload everyone re-grabs freely. */
 const SAVE_KEY = 'save';
 let saveT = null, _idbp = null;
 function idb(){
@@ -1879,8 +1579,9 @@ function snapshotSave(){
     pieces: [...S.pieces.values()].map(p => [p.id, Math.round(p.x), Math.round(p.y), p.g, p.z])
   };
 }
-function saveSoon(){ if(!saveT) saveT = setTimeout(saveNow, 900); }
+function saveSoon(){ if(!NET.solo) return; if(!saveT) saveT = setTimeout(saveNow, 900); }
 function saveNow(){
+  if(!NET.solo) return;                   // server mode: the host keeps the save
   if(saveT){ clearTimeout(saveT); saveT = null; }
   if(!S.started || !S.puzzle) return;
   const data = snapshotSave();
@@ -1890,6 +1591,7 @@ function saveNow(){
   });
 }
 function saveUrgent(){ // page is going away — write what must survive, synchronously where possible
+  if(!NET.solo) return;
   if(!S.started || !S.puzzle) return;
   const data = snapshotSave();
   saveLocalStorage(data);                 // sync, no picture (keeps positions safe)
@@ -1959,101 +1661,37 @@ async function beginSession(short){
   S.me.name = ($('#nameIn').value || '').trim().slice(0, 18) || S.me.name;
   try{ localStorage.setItem('jt_name', S.me.name); }catch(e){}
   closeModal('#mStart');
+  closeModal('#mNew');
   await ensureDefaultArt();
+  await ensureImageUploaded();
   newGame({ short: short || 6 });
-  toast('Session started — press Invite to play together', 'ok', 3400);
 }
 
-/* waiting helper used by invite/join dialogs */
-function waitConnection(statusEl, onOk){
-  const t0 = Date.now();
-  const iv = setInterval(() => {
-    const up = NET.connectedIds();
-    if(up.length){
-      clearInterval(iv);
-      statusEl.textContent = 'Connected.';
-      statusEl.className = 'status ok';
-      onOk && setTimeout(onOk, 500);
-      return;
-    }
-    // both sides are empty-handed: the lowest id boots a default game
-    if(!S.started && up.length === 0 && Date.now() - t0 > 4000){
-      const relays = [...NET.peers.values()].filter(p => p.dc);
-      if(relays.length && relays.every(p => p.id && S.me.id < p.id)){
-        clearInterval(iv);
-        ensureDefaultArt().then(() => newGame({})).then(() => {
-          statusEl.textContent = 'Connected.';
-          onOk && setTimeout(onOk, 400);
-        });
-        return;
-      }
-    }
-    if(Date.now() - t0 > 120000){
-      clearInterval(iv);
-      statusEl.textContent = 'Still waiting — check the codes and try again.';
-      statusEl.className = 'status bad';
-    }
-  }, 350);
-}
-
-/* ---------------- invite dialog ---------------- */
-$('#bInvite').addEventListener('click', async () => {
-  openModal('#mInvite');
-  $('#invOffer').value = ''; $('#invAnswer').value = '';
-  $('#invStatus').textContent = 'Generating invite code…';
-  $('#bInvConnect').disabled = true;
-  try{
-    const code = await createInvite();
-    $('#invOffer').value = code;
-    $('#invStatus').textContent = 'Code ready — send it to the other player.';
-    $('#bInvConnect').disabled = false;
-  }catch(err){
-    $('#invStatus').textContent = err.message;
+/* ---------------- start dialog: ONE press ----------------
+   Server mode: "Play" joins the running game, or — on an empty table —
+   opens the new-game dialog for the first player. Solo (file) mode:
+   "Play" starts a local session right away. */
+$('#bStartNew').addEventListener('click', async () => {
+  S.me.name = ($('#nameIn').value || '').trim().slice(0, 18) || S.me.name;
+  try{ localStorage.setItem('jt_name', S.me.name); }catch(e){}
+  if(NET.connected) NET.bcast({ t: 'name', name: S.me.name });
+  if(!NET.solo && NET.lastWelcome && NET.lastWelcome.st){
+    closeModal('#mStart');                // a game is running — drop straight in
+    return;
   }
-});
-$('#bInvCopy').addEventListener('click', () => copyText($('#invOffer').value));
-$('#bInvLink').addEventListener('click', () => {
-  const base = location.href.split('#')[0];
-  copyText(base + '#j=' + $('#invOffer').value);
-});
-$('#bInvConnect').addEventListener('click', async () => {
-  try{
-    $('#invStatus').textContent = 'Connecting…';
-    await completeInvite($('#invAnswer').value);
-    waitConnection($('#invStatus'), () => closeModal('#mInvite'));
-  }catch(err){
-    $('#invStatus').textContent = err.message;
+  if(!NET.solo && !NET.lastWelcome){      // server has not answered yet — give it a moment
+    for(let i = 0; i < 12 && !NET.lastWelcome; i++) await new Promise(r => setTimeout(r, 250));
   }
-});
-
-/* ---------------- join dialog ---------------- */
-let pendingJoinCode = '';
-function openJoin(prefill){
-  openModal('#mJoin');
-  if(prefill) $('#joinOffer').value = prefill;
-}
-$('#bJoin').addEventListener('click', () => openJoin());
-$('#bStartJoin').addEventListener('click', () => {
   closeModal('#mStart');
-  openJoin(pendingJoinCode);
-  pendingJoinCode = '';
-});
-$('#bJoinGen').addEventListener('click', async () => {
-  const st = $('#joinStatus1');
-  try{
-    st.textContent = 'Generating reply…';
-    const reply = await acceptInviteCode($('#joinOffer').value);
-    $('#joinReply').value = reply;
-    st.textContent = 'Now send the reply code back — the board will load automatically.';
-    waitConnection(st, () => closeModal('#mJoin'));
-  }catch(err){
-    st.textContent = err.message;
+  if(S.started && S.puzzle) return;       // a board arrived while we waited
+  if(!NET.solo && NET.lastWelcome){       // empty table — the first player creates
+    openModal('#mNew');
+    ensureDefaultArt().then(refreshThumb).catch(() => {});
+    return;
   }
+  await beginSession(6);                  // solo file mode
+  toast('Session started — open this page through server.js to play together', 'ok', 3600);
 });
-$('#bJoinCopy').addEventListener('click', () => copyText($('#joinReply').value));
-
-/* ---------------- start dialog ---------------- */
-$('#bStartNew').addEventListener('click', () => beginSession(6));
 $('#bContinue').addEventListener('click', continueSession);
 
 /* ---------------- new game dialog ----------------
@@ -2086,8 +1724,9 @@ $('#bNew').addEventListener('click', () => { refreshThumb(); openModal('#mNew');
 $('#bNgCreate').addEventListener('click', async () => {
   const short = +$('#ngShort').value;
   closeModal('#mNew');
-  if(!S.started) { await beginSession(short); return; }
+  if(!S.started){ await beginSession(short); return; }
   S.me.name = ($('#nameIn').value || '').trim().slice(0, 18) || S.me.name;
+  await ensureImageUploaded();
   newGame({ short });
   toast('New game dealt', 'ok');
 });
@@ -2106,7 +1745,7 @@ async function handlePictureFile(f, mode){
   if(!S.started){
     try{
       await applyImageBytes(bytes, f.name);
-      beginSession(6);
+      await beginSession(6);
     }catch(e){ toast(e.message, 'err'); }
     return;
   }
@@ -2114,8 +1753,9 @@ async function handlePictureFile(f, mode){
   if(mode === 'newgame'){ refreshThumb(); return; }
   // swap the picture mid-session, keep the layout; everyone follows
   if(S.puzzle){ S.puzzle.imgHash = S.imgHash; S.puzzle.imgName = S.imgName; }
+  await ensureImageUploaded();            // the host must hold the new picture first
   NET.bcast({ t: 'sync', st: makeState() });
-  toast('Picture updated for everyone', 'ok');
+  toast(NET.solo ? 'Picture updated' : 'Picture updated for everyone', 'ok');
 }
 window.addEventListener('dragover', e => e.preventDefault());
 window.addEventListener('drop', e => {
@@ -2150,29 +1790,27 @@ $('#bSolvedNew').addEventListener('click', () => { closeModal('#mSolved'); S.sol
 function boot(){
   resize();
   $('#nameIn').value = localStorage.getItem('jt_name') || S.me.name;
-  loadSave().then(d => {            // offer the saved session, with a peek at what it holds
-    if(!d) return;
-    const b = $('#bContinue');
-    const n = (d.pieces || []).length;
-    const t = new Date(d.savedAt || Date.now());
-    const hh = String(t.getHours()).padStart(2, '0'), mm = String(t.getMinutes()).padStart(2, '0');
-    b.textContent = 'Continue last session · ' + (n ? n + ' pieces · ' : '') + 'saved ' + hh + ':' + mm;
-    b.hidden = false;
-  });
-  if(location.hash.startsWith('#j=')){
-    try{ pendingJoinCode = decodeURIComponent(location.hash.slice(3)); }catch(e){}
-    if(pendingJoinCode){
-      $('#bStartJoin').textContent = 'Join with the code from your link';
-      history.replaceState(null, '', location.pathname + location.search);
-    }
+  if(location.protocol === 'http:' || location.protocol === 'https:'){
+    $('#startMode').textContent = 'You are at the table on ' + location.host +
+      ' — everyone who opens this address plays on the same board.';
+    netConnect();          // connects and joins automatically once you press Play
+  }else{
+    $('#startMode').textContent = 'Opened as a file — this runs solo. To play together: run ' +
+      'node server.js next to this file and open the address it prints.';
+    loadSave().then(d => { // offer the saved session, with a peek at what it holds
+      if(!d) return;
+      const b = $('#bContinue');
+      const n = (d.pieces || []).length;
+      const t = new Date(d.savedAt || Date.now());
+      const hh = String(t.getHours()).padStart(2, '0'), mm = String(t.getMinutes()).padStart(2, '0');
+      b.textContent = 'Continue last session · ' + (n ? n + ' pieces · ' : '') + 'saved ' + hh + ':' + mm;
+      b.hidden = false;
+    });
   }
   updateRosterUI();
-  startHeartbeat();
-  setInterval(ensureMesh, 3500);
-  setInterval(bcastPlayers, 30000);
-  window.addEventListener('beforeunload', () => { try{ leaveSession(); saveUrgent(); }catch(e){} });
+  window.addEventListener('beforeunload', () => { try{ leaveSession(); }catch(e){} });
   document.addEventListener('visibilitychange', () => {
-    if(document.hidden){ try{ saveNow(); }catch(e){} } // tab hidden / phone locked — flush now
+    if(document.hidden && NET.solo){ try{ saveNow(); }catch(e){} } // tab hidden — flush now
   });
   requestAnimationFrame(frame);
 }
@@ -2180,18 +1818,17 @@ boot();
 
 /* ---------------- debug / test hooks ---------------- */
 window.__JZ = {
-  S, NET, cam, version: '1.0',
+  S, NET, cam, version: '2.0',
   w2s: (x, y) => w2s(x, y),
   s2w: (x, y) => s2w(x, y),
   pieces: () => [...S.pieces.values()].map(p => ({ id: p.id, x: +p.x.toFixed(1), y: +p.y.toFixed(1), g: p.g, z: p.z })),
   puzzle: () => S.puzzle,
   gridFor,
-  connected: () => NET.connectedIds().map(id => ({ id, name: (NET.peers.get(id) || {}).name })),
+  connected: () => NET.connectedIds().map(id => ({ id, name: (S.players.get(id) || {}).name })),
   started: () => S.started && !!S.puzzle,
   hasImage: () => !!(S.imgBytes && S.imgHash === (S.puzzle && S.puzzle.imgHash)),
   api: {
     beginSession, newGame: o => newGame(o), shuffle: shuffleAll,
-    createInvite, acceptInviteCode, completeInvite,
     state: () => makeState(),
     grab: g => grabLocal(g),
     stream: (g, x, y) => { setGroupAnchor(g, x, y); NET.bcast({ t: 'm', g, x, y }); },
@@ -2216,7 +1853,9 @@ window.__JZ = {
     },
     saveNow: () => saveNow(),
     loadSave: () => loadSave(),
-    applyImageBytes
+    applyImageBytes,
+    publish: () => publishState(),       // quiet state publish to the host
+    upload: () => ensureImageUploaded()
   }
 };
 
